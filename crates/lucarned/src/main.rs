@@ -565,9 +565,14 @@ struct RemoteFileConfig {
     auth_token: Option<String>,
     readonly_token: Option<String>,
     insecure: Option<bool>,
-    /// H6c: generic provider field maps keyed by provider id.
+    /// H6c: generic provider field maps keyed by provider id. Inner values are
+    /// `Option<String>` so a YAML `null` (the documented "leave blank" form, e.g.
+    /// `token: null` for a quick tunnel) deserializes to `None` and is treated as
+    /// absent — never the literal string `"null"`, which would otherwise be passed
+    /// to the provider as a real field value.
     #[serde(default)]
-    providers: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    providers:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, Option<String>>>,
     /// DEPRECATED: legacy cloudflare-specific sub-map. Kept for backward
     /// compatibility; merged into `providers.cloudflared` at resolution time.
     #[serde(default)]
@@ -998,13 +1003,18 @@ fn resolve_provider_fields(
             fields.insert(key, value);
         }
     }
-    // Generic providers.<provider> map wins over the legacy block.
+    // Generic providers.<provider> map wins over the legacy block. A `None`
+    // (YAML `null`) or empty value is treated as absent so it never shadows a
+    // value the provider would otherwise treat as missing (e.g. a quick-tunnel
+    // `token: null` must NOT become the string "null").
     if let Some(map) = remote.providers.get(provider) {
         for (key, value) in map {
-            if value.is_empty() {
-                continue;
+            match value.as_deref() {
+                Some(v) if !v.is_empty() => {
+                    fields.insert(key.clone(), v.to_string());
+                }
+                _ => continue,
             }
-            fields.insert(key.clone(), value.clone());
         }
     }
     fields
@@ -2039,6 +2049,22 @@ health:
         let cfg = LucarnedFileConfig::from_yaml_str(default_lucarned_config().as_ref())
             .expect("default lucarned config must parse, including remote.providers with nulls");
         assert_eq!(cfg.remote.enabled, Some(false));
+
+        // Regression guard (live-test bug): YAML `null` provider fields MUST
+        // resolve to ABSENT — never the literal string "null". Otherwise a
+        // quick-tunnel default (token/public_url: null) is misread as a named
+        // tunnel and `cloudflared` validation fails ("invalid public_url").
+        let resolved = resolve_provider_fields(&cfg.remote, "cloudflared");
+        assert!(
+            !resolved.contains_key("token"),
+            "null token must be absent, got {:?}",
+            resolved.get("token")
+        );
+        assert!(
+            !resolved.contains_key("public_url"),
+            "null public_url must be absent, got {:?}",
+            resolved.get("public_url")
+        );
     }
 
     #[test]
@@ -2078,14 +2104,24 @@ remote:
             .providers
             .get("cloudflared")
             .expect("cloudflared provider block");
-        assert_eq!(cf.get("token").map(String::as_str), Some("cf-token"));
         assert_eq!(
-            cf.get("public_url").map(String::as_str),
+            cf.get("token").and_then(|v| v.as_deref()),
+            Some("cf-token")
+        );
+        assert_eq!(
+            cf.get("public_url").and_then(|v| v.as_deref()),
             Some("https://tunnel.example.com")
         );
         assert_eq!(
-            cf.get("binary_path").map(String::as_str),
+            cf.get("binary_path").and_then(|v| v.as_deref()),
             Some("/usr/local/bin/cloudflared")
+        );
+        // resolve_provider_fields surfaces the concrete values for the provider.
+        let resolved = resolve_provider_fields(&config.remote, "cloudflared");
+        assert_eq!(resolved.get("token").map(String::as_str), Some("cf-token"));
+        assert_eq!(
+            resolved.get("public_url").map(String::as_str),
+            Some("https://tunnel.example.com")
         );
 
         // Back-compat: the legacy `cloudflare:` block still parses (H6c).
