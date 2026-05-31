@@ -11,6 +11,16 @@ readme = "../../README.md"
 [features]
 default = []
 memory-profiling = ["lucarne/memory-profiling"]
+# Optional remote-access subsystem (Locked decision L6/L8): pulls the tunnel
+# provider registry, the terminal gateway, the rmux monitor, and the web chat
+# bridge. Default daemon builds MUST NOT pull any of these — keep `default = []`.
+remote = [
+    "dep:lucarne-remote",
+    "dep:lucarne-termgw",
+    "dep:lucarne-rmux",
+    "dep:lucarne-web",
+    "dep:axum",
+]
 
 [[bin]]
 name = "lucarned"
@@ -23,6 +33,15 @@ lucarned-ctl = { path = "../lucarned-ctl", features = ["updates"] }
 lucarne-adapter = { path = "../lucarne-adapter" }
 lucarne-telegram = { path = "../lucarne-telegram" }
 lucarne-wechat = { path = "../lucarne-wechat" }
+# Remote-access subsystem deps — optional, gated behind the `remote` feature so
+# the default daemon build does not compile or link any of them.
+lucarne-remote = { path = "../lucarne-remote", optional = true }
+lucarne-termgw = { path = "../lucarne-termgw", optional = true }
+lucarne-rmux = { path = "../lucarne-rmux", optional = true }
+lucarne-web = { path = "../lucarne-web", optional = true }
+# axum is only needed to merge the terminal gateway + web chat onto one loopback
+# port (the single converter); pulled in only under `remote`.
+axum = { version = "0.8", optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }

@@ -1,0 +1,16 @@
+[package]
+name = "lucarne-archive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# Shared terminal-session archive store (~/.lucarne/term-archive/). Used by both
+# the gateway and the `term` CLI so web and CLI see the same archives. A closed
+# terminal's captured content is preserved here as one JSON record per archive.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+dirs = { workspace = true }

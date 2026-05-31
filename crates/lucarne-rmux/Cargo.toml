@@ -1,0 +1,26 @@
+[package]
+name = "lucarne-rmux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# The live rmux-sdk binding for the terminal-monitor subsystem: connects to the
+# SYSTEM rmux daemon (default socket — the daemon the user's own `rmux` uses),
+# mirrors its panes into the rmux-free `lucarne-term` vocabulary, and injects
+# input. The ONLY crate that names `rmux_sdk` (boundary discipline) — preview-API
+# churn stops here. Optional in lucarned via the `rmux` feature so default builds
+# never pull the preview SDK.
+
+[dependencies]
+lucarne-term = { path = "../lucarne-term" }
+# PINNED rmux preview (=0.3.1) — preview APIs break between patches; bump only
+# deliberately. Validated against the running daemon in spike4-attach-handoff.
+rmux-sdk = "=0.3.1"
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
