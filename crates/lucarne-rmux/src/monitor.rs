@@ -23,6 +23,7 @@ use rmux_sdk::{
     EnsureSession, EnsureSessionPolicy, Pane, ProcessSpec, Rmux, SessionName, TerminalSizeSpec,
 };
 use tokio::sync::{broadcast, Mutex};
+use tokio::task::JoinHandle;
 
 use lucarne_term::{
     control_key_token, Cursor, Dims, Origin, PaneGrid, SessionDescriptor, SessionId,
@@ -80,6 +81,30 @@ pub struct RmuxMonitor {
     registry: Arc<Mutex<SessionRegistry>>,
     tracked: Arc<Mutex<HashMap<SessionId, Tracked>>>,
     updates: broadcast::Sender<GridUpdate>,
+    /// JoinHandles for every detached per-pane source loop spawned by
+    /// [`RmuxMonitor::spawn_source_loop`]. Held so they can be aborted when the
+    /// monitor is dropped (Drop-based abort, mirroring
+    /// `lucarne_adapter::AdapterSupervisorHandle::drop`): without this the loops
+    /// would leak — they only `break` when rmux closes their render stream, so a
+    /// dropped monitor whose streams stay open would otherwise spin tasks forever.
+    source_loops: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+/// Abort every spawned source loop when the monitor is dropped (mirrors
+/// `AdapterSupervisorHandle::drop`'s task abort). Each loop's only self-exit is
+/// "rmux closed the render stream"; aborting here guarantees the detached tasks
+/// are reclaimed promptly on monitor teardown rather than leaking until the
+/// runtime stops. `try_lock` (not blocking) keeps `Drop` non-blocking; the
+/// `tracked`/`source_loops` mutex is uncontended at drop time (no other holder
+/// remains once the monitor is being dropped), so the abort lands in practice.
+impl Drop for RmuxMonitor {
+    fn drop(&mut self) {
+        if let Ok(loops) = self.source_loops.try_lock() {
+            for handle in loops.iter() {
+                handle.abort();
+            }
+        }
+    }
 }
 
 impl RmuxMonitor {
@@ -91,13 +116,18 @@ impl RmuxMonitor {
             .connect_or_start()
             .await
             .map_err(|e| MonitorError::Rmux(format!("connect_or_start: {e}")))?;
-        tracing::info!(endpoint = ?rmux.endpoint(), "monitor: connected to system rmux daemon");
+        tracing::info!(
+            target: "lucarne_rmux",
+            endpoint = ?rmux.endpoint(),
+            "connected to system rmux daemon"
+        );
         let (updates, _) = broadcast::channel(GRID_BROADCAST_CAP);
         Ok(Self {
             rmux,
             registry: Arc::new(Mutex::new(SessionRegistry::new())),
             tracked: Arc::new(Mutex::new(HashMap::new())),
             updates,
+            source_loops: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -124,7 +154,11 @@ impl RmuxMonitor {
             let title = name.as_str().to_string();
             match self.track(name, Origin::Adopted, title).await {
                 Ok(desc) => out.push(desc),
-                Err(e) => tracing::warn!(error = %e, "monitor: adopt failed; skipping session"),
+                Err(e) => tracing::warn!(
+                    target: "lucarne_rmux",
+                    error = %e,
+                    "adopt failed; skipping session"
+                ),
             }
         }
         Ok(out)
@@ -192,7 +226,13 @@ impl RmuxMonitor {
                 .await
                 .map_err(|e| MonitorError::Rmux(format!("send_key {id}: {e}")))?,
             TermInput::ResizeHint { cols, rows } => {
-                tracing::debug!(%id, cols, rows, "monitor: resize hint (no PTY resize)");
+                tracing::debug!(
+                    target: "lucarne_rmux",
+                    %id,
+                    cols,
+                    rows,
+                    "resize hint (no PTY resize)"
+                );
             }
         }
         Ok(())
@@ -273,7 +313,12 @@ impl RmuxMonitor {
                 rows: snap.rows,
             },
             Err(e) => {
-                tracing::debug!(%id, error = %e, "monitor: dims probe failed; using defaults");
+                tracing::debug!(
+                    target: "lucarne_rmux",
+                    %id,
+                    error = %e,
+                    "dims probe failed; using defaults"
+                );
                 Dims {
                     cols: DEFAULT_COLS,
                     rows: DEFAULT_ROWS,
@@ -294,13 +339,22 @@ impl RmuxMonitor {
                 name,
             },
         );
-        self.spawn_source_loop(id, pane);
+        // Detached source loop, but its JoinHandle is RETAINED (not dropped) so
+        // `impl Drop for RmuxMonitor` can abort it on teardown — no leaked tasks.
+        let handle = self.spawn_source_loop(id, pane);
+        self.source_loops.lock().await.push(handle);
         Ok(desc)
     }
 
     /// Per-pane source loop: seed one full snapshot, then stream render updates
     /// (each a full `PaneSnapshot` — rmux has no native delta) into the fan-out.
-    fn spawn_source_loop(&self, id: SessionId, pane: Pane) {
+    ///
+    /// Returns the spawned task's [`JoinHandle`] so the caller can retain it for
+    /// Drop-based abort (mirroring `AdapterSupervisorHandle`, which keeps its
+    /// task handles and aborts them in `Drop`). The loop's only self-exit is
+    /// "rmux closed the render stream"; without retaining + aborting the handle a
+    /// dropped monitor with still-open streams would leak the task.
+    fn spawn_source_loop(&self, id: SessionId, pane: Pane) -> JoinHandle<()> {
         let tx = self.updates.clone();
         tokio::spawn(async move {
             match pane.snapshot().await {
@@ -311,13 +365,23 @@ impl RmuxMonitor {
                         cursor: adapter::map_cursor(snap.cursor),
                     });
                 }
-                Err(e) => tracing::warn!(session = %id, error = %e, "monitor: initial snapshot failed"),
+                Err(e) => tracing::warn!(
+                    target: "lucarne_rmux",
+                    session = %id,
+                    error = %e,
+                    "initial snapshot failed"
+                ),
             }
 
             let mut stream = match pane.render_stream().await {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!(session = %id, error = %e, "monitor: render_stream unavailable; single snapshot only");
+                    tracing::warn!(
+                        target: "lucarne_rmux",
+                        session = %id,
+                        error = %e,
+                        "render_stream unavailable; single snapshot only"
+                    );
                     return;
                 }
             };
@@ -332,16 +396,25 @@ impl RmuxMonitor {
                         });
                     }
                     Ok(None) => {
-                        tracing::info!(session = %id, "monitor: render stream closed");
+                        tracing::info!(
+                            target: "lucarne_rmux",
+                            session = %id,
+                            "render stream closed"
+                        );
                         break;
                     }
                     Err(e) => {
-                        tracing::warn!(session = %id, error = %e, "monitor: render stream error; ending loop");
+                        tracing::warn!(
+                            target: "lucarne_rmux",
+                            session = %id,
+                            error = %e,
+                            "render stream error; ending loop"
+                        );
                         break;
                     }
                 }
             }
-        });
+        })
     }
 }
 

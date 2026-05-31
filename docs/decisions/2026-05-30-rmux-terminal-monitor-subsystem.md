@@ -33,7 +33,7 @@ in two new crates:
   system daemon, adopt sessions, mirror panes, inject input). It is the ONLY
   crate that names `rmux_sdk`.
 
-It is wired into `lucarned` behind an optional `rmux` cargo feature so default
+It is wired into `lucarned` behind an optional `remote` cargo feature so default
 builds never pull the preview SDK.
 
 ### Monitor model
@@ -76,13 +76,15 @@ preview SDK to one crate and lets every downstream consumer compile without it.
 Feature-gating in `lucarned` keeps the default resident daemon lean (the release
 profile is size-optimized) while making the capability opt-in.
 
-Agent chat reaching the web client is a SEPARATE concern handled by a new web
-`Channel` (peer to Telegram/WeChat), not by this subsystem — the web app simply
-hosts both a terminal view and a chat view.
+Agent chat reaching the web client is a SEPARATE concern handled by a web
+WebSocket agent bridge — peer in spirit to the Telegram/WeChat channels, but a
+ws bridge that drives a Lucarne `AgentRuntime` session directly rather than a
+`lucarne_channel::Channel` trait implementation — not by this subsystem. The web
+app simply hosts both a terminal view and a chat view.
 
 ## Consequences
 
-- `lucarned` gains an optional `rmux` feature that starts the monitor and the
+- `lucarned` gains an optional `remote` feature that starts the monitor and the
   terminal gateway; default builds are unaffected.
 - The gateway (`lucarne-termgw`) consumes the monitor's grid fan-out, applies the
   per-client differ, and serves an interactive web terminal view + an HTTP

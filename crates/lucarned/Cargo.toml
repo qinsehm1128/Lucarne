@@ -41,7 +41,7 @@ lucarne-rmux = { path = "../lucarne-rmux", optional = true }
 lucarne-web = { path = "../lucarne-web", optional = true }
 # axum is only needed to merge the terminal gateway + web chat onto one loopback
 # port (the single converter); pulled in only under `remote`.
-axum = { version = "0.8", optional = true }
+axum = { workspace = true, optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }

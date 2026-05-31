@@ -3,18 +3,20 @@ name = "lucarne-agentbind"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Bind an rmux pane to its agent session and read the transcript as chat."
 rust-version.workspace = true
 repository.workspace = true
 
 # Bind an rmux pane to the agent session running inside it. An agent started
 # interactively in a pane (claude/codex) emits no structured stream to us, but it
-# DOES write a transcript file keyed by cwd. Given the pane's cwd we locate that
+# DOES write a transcript file keyed by cwd. Given the pane's cwd we resolve that
 # transcript and parse it into chat bubbles — so an interactive agent can still be
-# shown (and, via pane input, driven) in chat mode. Zero heavy deps; the robust
-# upstream form would reuse Lucarne's `agent-sessions` parser.
+# shown (and, via pane input, driven) in chat mode. Discovery, file-format, and
+# parse rules are owned by the `agent-sessions` provider layer (the provider
+# boundary in AGENTS.md); this crate only orchestrates through its descriptors.
 
 [dependencies]
-serde_json = { workspace = true }
+agent-sessions = { path = "../../agent-sessions", features = ["discovery", "agent_session", "claude", "codex"] }
 dirs = { workspace = true }
 rusqlite = { workspace = true }
 

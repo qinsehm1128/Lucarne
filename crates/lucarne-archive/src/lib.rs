@@ -83,7 +83,7 @@ pub fn list() -> Vec<ArchiveMeta> {
             });
         }
     }
-    out.sort_by(|a, b| b.archived_at.cmp(&a.archived_at));
+    out.sort_by_key(|b| std::cmp::Reverse(b.archived_at));
     out
 }
 

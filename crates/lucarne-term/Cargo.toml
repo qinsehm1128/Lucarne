@@ -3,6 +3,7 @@ name = "lucarne-term"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "rmux-free terminal vocabulary, snapshot differ and session registry."
 rust-version.workspace = true
 repository.workspace = true
 

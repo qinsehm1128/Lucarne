@@ -3,13 +3,14 @@ name = "lucarne-termgw"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Axum WebSocket/HTTP gateway over the rmux terminal monitor."
 rust-version.workspace = true
 repository.workspace = true
 
 # Terminal gateway: an axum WebSocket + HTTP surface over the rmux terminal
 # monitor. Consumes the monitor's grid fan-out, applies a per-client differ, and
 # serves an interactive web terminal view + a small control API for the CLI.
-# Pulled into lucarned only via the `rmux` feature (axum/tower-http are not in
+# Pulled into lucarned only via the `remote` feature (axum/tower-http are not in
 # the default daemon).
 
 [dependencies]
@@ -17,7 +18,7 @@ lucarne-term = { path = "../lucarne-term" }
 lucarne-rmux = { path = "../lucarne-rmux" }
 lucarne-agentbind = { path = "../lucarne-agentbind" }
 async-trait = { workspace = true }
-axum = { version = "0.8", features = ["ws"] }
+axum = { workspace = true, features = ["ws"] }
 tower-http = { version = "0.6", features = ["fs"] }
 dirs = { workspace = true }
 tokio = { workspace = true }

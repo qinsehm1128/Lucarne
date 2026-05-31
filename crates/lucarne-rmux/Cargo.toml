@@ -3,6 +3,7 @@ name = "lucarne-rmux"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Live rmux-sdk binding (adapter + monitor) for the terminal-monitor subsystem."
 rust-version.workspace = true
 repository.workspace = true
 
@@ -10,7 +11,7 @@ repository.workspace = true
 # SYSTEM rmux daemon (default socket — the daemon the user's own `rmux` uses),
 # mirrors its panes into the rmux-free `lucarne-term` vocabulary, and injects
 # input. The ONLY crate that names `rmux_sdk` (boundary discipline) — preview-API
-# churn stops here. Optional in lucarned via the `rmux` feature so default builds
+# churn stops here. Optional in lucarned via the `remote` feature so default builds
 # never pull the preview SDK.
 
 [dependencies]

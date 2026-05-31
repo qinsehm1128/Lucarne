@@ -176,6 +176,26 @@ Telegram 入口 chat 需要开启 Topics/Thread mode。可以直接使用 Bot �
 Telegram workspace 映射为 Forum Topic。一个项目一个 topic；一个 topic 可绑定一个 live Agent session。
 - Telegram支持WeChat所有功能
 
+### 终端监控与 `term` CLI（可选）
+
+终端监控子系统是 feature-gated 的，默认关闭。用 `--features remote` 构建 daemon
+即可启用。它把系统级 rmux daemon 上的会话镜像到 web 终端视图，提供一个由 Lucarne
+agent session 支撑的 web chat 视图，并允许把某个会话弹出到本地终端、再收回，而远程
+镜像保持运行。
+
+轻量 `term` CLI 操作同一个 rmux daemon 与共享 archive store：
+
+```bash
+term ls                 # 列出终端会话
+term attach <id>        # 把会话弹出到本地终端
+term detach <id>        # 收回（远程镜像继续运行）
+term go-public          # 通过远程接入隧道把 web 视图对外暴露
+```
+
+`term go-public` 会枚举内置隧道 provider（Cloudflared 优先），无回显地提示输入所需
+密钥，并打印登录 URL 的终端二维码，让手机能远程访问终端与 chat 视图。
+
+
 ---
 
 ## 架构概览
@@ -198,6 +218,29 @@ Telegram workspace 映射为 Forum Topic。一个项目一个 topic；一个 top
     ┌──────┬──────┬──────┬──────┐
   Claude  Codex Gemini Copilot  Pi  ← Agent CLI 进程
 ```
+
+### 终端监控子系统（可选，`--features remote`）
+
+一个并行子系统：把用户系统级 rmux 终端会话镜像到 web 客户端，并提供一个 web
+chat 桥，全部可通过隧道远程访问。默认 daemon 构建不会编译或链接其中任何一部分。
+
+```
+   ┌──────────────┐   ┌──────────────┐
+   │ web terminal │   │   web chat   │  ← 浏览器（终端视图 + chat 视图）
+   └──────┬───────┘   └──────┬───────┘
+          │                  │
+    lucarne-termgw      lucarne-web      ← Axum ws/HTTP 网关 + AgentRuntime ws 桥
+          │                  │
+    lucarne-rmux        (lucarne)        ← 实时 rmux-sdk 绑定（adapter + monitor）
+          │
+    lucarne-term                         ← rmux-free 终端词汇 + differ + registry
+          │
+   ┌──────┴───────┐
+   │ 系统 rmux    │   lucarne-remote     ← go-public 隧道注册表（Cloudflared 优先）
+   │   daemon     │
+   └──────────────┘   term CLI           ← 轻量 `term` CLI：list / attach / detach / go-public
+```
+
 ---
 
 ## Agent 能力矩阵
@@ -233,7 +276,7 @@ cargo +nightly test -Zbuild-dir-new-layout
 - [x] Windows 支持：补齐安装说明、后台运行、路径 / 进程兼容与发布包
 - [ ] 消息模式 steer/queue
 - [ ] agent-sessions 整理为独立crate
-- [ ] 支持远程 agent 环境
+- [x] 支持远程 agent 环境：rmux 终端监控 + web chat 桥 + go-public 隧道（`--features remote`）
 - [ ] 更多 Agent Provider：Cursor、opencode 等
 - [ ] More channels：Discord、Slack、飞书、钉钉、Matrix、QQ 等更多入口
 - [ ] ....

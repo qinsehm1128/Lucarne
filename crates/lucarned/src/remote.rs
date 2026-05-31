@@ -801,3 +801,260 @@ pub async fn spawn_remote_subsystem(
         public_url,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    // `TunnelHandle::public_url` is a `url::Url`; lucarned does not depend on the
+    // `url` crate directly, but reqwest re-exports the very same type, so build
+    // test URLs through `reqwest::Url` (== `url::Url`).
+    use reqwest::Url;
+
+    /// A 32+ char token that satisfies SEC-008 (`from_secret_validated`:
+    /// non-whitespace, `>= MIN_EXPLICIT_TOKEN_LEN` = 32). Used wherever a test
+    /// needs a *valid* operator-supplied token.
+    const VALID_TOKEN: &str = "0123456789abcdef0123456789abcdef"; // exactly 32 chars
+    const VALID_READONLY: &str = "ro-0123456789abcdef0123456789abcdef"; // > 32 chars
+
+    fn base_config() -> RemoteRuntimeConfig {
+        RemoteRuntimeConfig {
+            provider: "cloudflared".to_string(),
+            gateway_addr: "127.0.0.1:7800".parse().unwrap(),
+            control_addr: "127.0.0.1:7801".parse().unwrap(),
+            auth_token: None,
+            readonly_token: None,
+            insecure: false,
+            provider_fields: BTreeMap::new(),
+            autostart: false,
+        }
+    }
+
+    fn fields(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// Build a `DaemonRemoteControl` for the pure-logic tests (no tunnel/rmux):
+    /// it sits in `Idle` with no gateway up, so `status`/`stop`/`status_from` can
+    /// be exercised without ever connecting rmux or binding a port.
+    fn control(config: RemoteRuntimeConfig, access_token: Option<String>) -> DaemonRemoteControl {
+        DaemonRemoteControl {
+            registry: lucarne_remote::builtin(),
+            config,
+            access_token,
+            state: Mutex::new(TunnelState::Idle),
+            auth: AuthState::disabled(),
+            ws_pool: WsConnectionPool::new(GatewayLimits::default()),
+            web_dir: PathBuf::from("web"),
+            gateway_up: Mutex::new(false),
+        }
+    }
+
+    // ---- G3: RemoteRuntimeConfig::provider_config override / merge ----
+
+    #[test]
+    fn provider_config_uses_daemon_fields_when_no_overrides() {
+        let mut config = base_config();
+        config.provider_fields = fields(&[("token", "cfg-token"), ("public_url", "https://a.test")]);
+        let cfg = config.provider_config(&BTreeMap::new());
+        assert_eq!(cfg.get("token"), Some("cfg-token"));
+        assert_eq!(cfg.get("public_url"), Some("https://a.test"));
+    }
+
+    #[test]
+    fn provider_config_cli_overrides_win_over_daemon_fields() {
+        let mut config = base_config();
+        config.provider_fields = fields(&[("token", "cfg-token"), ("public_url", "https://a.test")]);
+        // G3: a present override wins; an absent one keeps the configured value.
+        let overrides = fields(&[("token", "cli-token")]);
+        let cfg = config.provider_config(&overrides);
+        assert_eq!(cfg.get("token"), Some("cli-token"), "CLI override must win");
+        assert_eq!(
+            cfg.get("public_url"),
+            Some("https://a.test"),
+            "absent override keeps the configured value"
+        );
+    }
+
+    #[test]
+    fn provider_config_skips_empty_values_on_both_sides() {
+        let mut config = base_config();
+        // An empty configured field is skipped (treated as unset).
+        config.provider_fields = fields(&[("token", ""), ("public_url", "https://a.test")]);
+        // An empty override is skipped too — it must NOT clear a configured value.
+        let overrides = fields(&[("public_url", "")]);
+        let cfg = config.provider_config(&overrides);
+        assert_eq!(cfg.get("token"), None, "empty configured field is skipped");
+        assert_eq!(
+            cfg.get("public_url"),
+            Some("https://a.test"),
+            "empty override must not clear the configured value"
+        );
+    }
+
+    #[test]
+    fn provider_config_override_extends_with_new_field() {
+        let config = base_config(); // no configured fields
+        let overrides = fields(&[("token", "cli-only")]);
+        let cfg = config.provider_config(&overrides);
+        assert_eq!(cfg.get("token"), Some("cli-only"));
+    }
+
+    // ---- build_auth: read-only token branches (SEC-013) ----
+
+    #[test]
+    fn build_auth_without_readonly_token_is_single_token() {
+        let token = AccessToken::from_secret_validated(VALID_TOKEN).unwrap();
+        // None / empty readonly → single-token model, must succeed.
+        assert!(build_auth(token.clone(), None).is_ok());
+        let token2 = AccessToken::from_secret_validated(VALID_TOKEN).unwrap();
+        assert!(
+            build_auth(token2, Some("")).is_ok(),
+            "an empty readonly token is treated as absent (single-token model)"
+        );
+    }
+
+    #[test]
+    fn build_auth_with_valid_readonly_token_succeeds() {
+        let token = AccessToken::from_secret_validated(VALID_TOKEN).unwrap();
+        assert!(
+            build_auth(token, Some(VALID_READONLY)).is_ok(),
+            "a valid (>=32 char) readonly token enables the read-only tier"
+        );
+    }
+
+    #[test]
+    fn build_auth_rejects_weak_readonly_token() {
+        let token = AccessToken::from_secret_validated(VALID_TOKEN).unwrap();
+        // SEC-008: a non-empty but too-short readonly token must fail closed.
+        // (`AuthState` is not `Debug`, so match the Result rather than `expect_err`.)
+        match build_auth(token, Some("too-short")) {
+            Ok(_) => panic!("weak readonly token must be rejected"),
+            Err(err) => assert!(
+                err.to_string().contains("readonly_token"),
+                "error must point at the readonly_token field: {err}"
+            ),
+        }
+    }
+
+    // ---- M2: map_remote_error → RemoteControlError ----
+
+    #[test]
+    fn map_remote_error_missing_field_is_bad_config() {
+        let mapped = map_remote_error(lucarne_remote::RemoteError::MissingField("token".into()));
+        assert!(matches!(mapped, RemoteControlError::BadConfig(_)));
+        assert_eq!(mapped.status_code(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn map_remote_error_parse_is_bad_config() {
+        let mapped = map_remote_error(lucarne_remote::RemoteError::Parse("bad url".into()));
+        assert!(matches!(mapped, RemoteControlError::BadConfig(_)));
+    }
+
+    #[test]
+    fn map_remote_error_not_found_is_unknown_provider() {
+        let mapped = map_remote_error(lucarne_remote::RemoteError::NotFound("frp".into()));
+        assert!(matches!(mapped, RemoteControlError::UnknownProvider(_)));
+        assert_eq!(mapped.status_code(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn map_remote_error_spawn_and_io_are_backend() {
+        let spawn = map_remote_error(lucarne_remote::RemoteError::Spawn {
+            provider: "cloudflared".into(),
+            message: "no binary".into(),
+        });
+        assert!(matches!(spawn, RemoteControlError::Backend(_)));
+        assert_eq!(spawn.status_code(), axum::http::StatusCode::BAD_GATEWAY);
+
+        let io = map_remote_error(lucarne_remote::RemoteError::Io(std::io::Error::other("boom")));
+        assert!(matches!(io, RemoteControlError::Backend(_)));
+    }
+
+    // ---- DaemonRemoteControl::status_from: running / idle, token passthrough ----
+
+    #[test]
+    fn status_from_running_handle_reports_provider_and_url() {
+        let ctl = control(base_config(), Some(VALID_TOKEN.to_string()));
+        let handle = TunnelHandle {
+            provider_id: "cloudflared".to_string(),
+            public_url: Url::parse("https://foo-bar.trycloudflare.com/").unwrap(),
+            opaque: "op-1".to_string(),
+        };
+        let status = ctl.status_from(Some(&handle));
+        assert!(status.running);
+        assert_eq!(status.provider.as_deref(), Some("cloudflared"));
+        assert_eq!(
+            status.public_url.as_deref(),
+            Some("https://foo-bar.trycloudflare.com/")
+        );
+        // L4: the access token is passed through regardless of running state.
+        assert_eq!(status.access_token.as_deref(), Some(VALID_TOKEN));
+    }
+
+    #[test]
+    fn status_from_none_reports_idle_but_keeps_token() {
+        let ctl = control(base_config(), Some(VALID_TOKEN.to_string()));
+        let status = ctl.status_from(None);
+        assert!(!status.running);
+        assert_eq!(status.provider, None);
+        assert_eq!(status.public_url, None);
+        // Token still surfaced when idle so `term go-public` can render the QR.
+        assert_eq!(status.access_token.as_deref(), Some(VALID_TOKEN));
+    }
+
+    #[test]
+    fn status_from_passes_through_absent_token() {
+        // insecure (no token) → access_token is None in both states.
+        let ctl = control(base_config(), None);
+        assert_eq!(ctl.status_from(None).access_token, None);
+        let handle = TunnelHandle {
+            provider_id: "cloudflared".to_string(),
+            public_url: Url::parse("https://x.trycloudflare.com/").unwrap(),
+            opaque: "op".to_string(),
+        };
+        assert_eq!(ctl.status_from(Some(&handle)).access_token, None);
+    }
+
+    // ---- state machine: the rmux-free reachable branches ----
+
+    #[tokio::test]
+    async fn status_when_idle_is_not_running() {
+        // `status()` on an Idle control needs no rmux: it short-circuits before
+        // any provider health await.
+        let ctl = control(base_config(), Some(VALID_TOKEN.to_string()));
+        let status = ctl.status().await;
+        assert!(!status.running);
+        assert_eq!(status.access_token.as_deref(), Some(VALID_TOKEN));
+    }
+
+    #[tokio::test]
+    async fn stop_when_idle_is_idempotent_success() {
+        // `stop()` on an Idle control is the idempotent no-op path (no rmux /
+        // provider call): it returns a not-running status without erroring.
+        let ctl = control(base_config(), Some(VALID_TOKEN.to_string()));
+        let status = ctl.stop().await.expect("idempotent stop must succeed");
+        assert!(!status.running);
+        assert_eq!(status.provider, None);
+    }
+
+    #[tokio::test]
+    async fn second_start_is_rejected_while_starting() {
+        // Provider-lookup / validate sit behind `ensure_gateway` (which connects
+        // rmux), so the reachable rmux-free state-machine guard is the busy-state
+        // rejection: a control already in `Starting` rejects a concurrent start.
+        let ctl = control(base_config(), Some(VALID_TOKEN.to_string()));
+        *ctl.state.lock().await = TunnelState::Starting;
+        let err = ctl
+            .start(RemoteStartParams::default())
+            .await
+            .expect_err("a start already in progress must be rejected");
+        assert!(matches!(err, RemoteControlError::Backend(_)));
+    }
+}
+

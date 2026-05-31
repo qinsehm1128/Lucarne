@@ -296,7 +296,7 @@ where
         match parts.extensions.get::<ConnectInfo<SocketAddr>>() {
             Some(ConnectInfo(peer)) if peer.ip().is_loopback() => Ok(LoopbackOnly),
             Some(ConnectInfo(peer)) => {
-                tracing::warn!(%peer, "termgw: rejected non-loopback access to /api/remote control plane");
+                tracing::warn!(target: "lucarne_termgw", %peer, "rejected non-loopback access to /api/remote control plane");
                 Err((StatusCode::FORBIDDEN, "remote control plane is loopback-only").into_response())
             }
             // No connect info recorded — fail closed.
@@ -327,7 +327,7 @@ where
         match parts.extensions.get::<AccessScope>() {
             Some(AccessScope::Full) => Ok(RequireFull),
             Some(AccessScope::ReadOnly) => {
-                tracing::info!("termgw: refused write request on read-only HTTP session");
+                tracing::info!(target: "lucarne_termgw", "refused write request on read-only HTTP session");
                 Err((
                     StatusCode::FORBIDDEN,
                     "read-only session: write operations are not permitted",
@@ -490,9 +490,9 @@ pub async fn authorize_ws(
 ) -> Result<(AccessScope, tokio::sync::OwnedSemaphorePermit), Response> {
     // M5: permit first so a full cap never burns a ticket.
     let Some(permit) = pool.try_acquire() else {
-        tracing::warn!(
+        tracing::warn!(target: "lucarne_termgw",
             cap = pool.limits().max_ws_connections,
-            "termgw: ws connection cap reached; rejecting upgrade with 503"
+            "ws connection cap reached; rejecting upgrade with 503"
         );
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -589,9 +589,9 @@ async fn bearer_guard(
                 }
             }
             if locked {
-                tracing::warn!(%key, "termgw: rate-limiter locked out client after repeated auth failures");
+                tracing::warn!(target: "lucarne_termgw", %key, "rate-limiter locked out client after repeated auth failures");
             } else {
-                tracing::warn!(%key, lockable, "termgw: rejected bearer auth failure");
+                tracing::warn!(target: "lucarne_termgw", %key, lockable, "rejected bearer auth failure");
             }
             (StatusCode::UNAUTHORIZED, "invalid or missing bearer token").into_response()
         }
@@ -650,22 +650,22 @@ pub async fn serve_with_auth(
 ) -> std::io::Result<()> {
     // default-deny: refuse public exposure without a token (unless explicit override).
     if let Err(refusal) = require_auth_or_refuse(remote, &auth.mode, insecure) {
-        tracing::error!(%refusal, "termgw: refusing to start");
+        tracing::error!(target: "lucarne_termgw", %refusal, "refusing to start");
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             refusal.to_string(),
         ));
     }
     if remote && insecure && !auth.mode.is_enforced() {
-        tracing::warn!(
-            "termgw: INSECURE public exposure with NO access token — anyone reaching \
+        tracing::warn!(target: "lucarne_termgw",
+            "INSECURE public exposure with NO access token — anyone reaching \
              the tunnel can drive your terminals. This is RCE-equivalent."
         );
     }
     // loopback hardening: in remote mode the gateway must bind a loopback addr.
     if remote && !addr.ip().is_loopback() {
         let err = GatewayAddrError::NonLoopback(addr);
-        tracing::error!(%err, "termgw: refusing to bind a non-loopback address in remote mode");
+        tracing::error!(target: "lucarne_termgw", %err, "refusing to bind a non-loopback address in remote mode");
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string()));
     }
 
@@ -673,7 +673,7 @@ pub async fn serve_with_auth(
     // control plane is served separately on loopback (see [`serve_control_plane`]).
     let app = router_with_limits(monitor, web_dir, auth, GatewayLimits::default());
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, remote, "termgw: listening");
+    tracing::info!(target: "lucarne_termgw", %addr, remote, "listening");
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -695,12 +695,12 @@ pub async fn serve_control_plane(
 ) -> std::io::Result<()> {
     if !addr.ip().is_loopback() {
         let err = GatewayAddrError::NonLoopback(addr);
-        tracing::error!(%err, "termgw: refusing to bind a non-loopback control-plane address");
+        tracing::error!(target: "lucarne_termgw", %err, "refusing to bind a non-loopback control-plane address");
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string()));
     }
     let app = control_router(remote_control);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "termgw: control plane listening (loopback-only)");
+    tracing::info!(target: "lucarne_termgw", %addr, "control plane listening (loopback-only)");
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -731,7 +731,7 @@ async fn http_remote_start(
     let params = match parse_start_params(&body) {
         Ok(params) => params,
         Err(detail) => {
-            tracing::warn!(%detail, "termgw: remote tunnel start rejected — malformed body");
+            tracing::warn!(target: "lucarne_termgw", %detail, "remote tunnel start rejected — malformed body");
             return (StatusCode::BAD_REQUEST, format!("invalid request body: {detail}"))
                 .into_response();
         }
@@ -740,7 +740,7 @@ async fn http_remote_start(
         Some(control) => match control.start(params).await {
             Ok(status) => Json(status).into_response(),
             Err(e) => {
-                tracing::warn!(error = %e, "termgw: remote tunnel start failed");
+                tracing::warn!(target: "lucarne_termgw", error = %e, "remote tunnel start failed");
                 // M2: the control plane is loopback-only (SEC-002), so a precise
                 // status + safe message is fine here — it never reaches a tunnel.
                 (e.status_code(), e.detail().to_string()).into_response()
@@ -774,7 +774,7 @@ async fn http_remote_stop(_loopback: LoopbackOnly, State(s): State<ControlState>
         Some(control) => match control.stop().await {
             Ok(status) => Json(status).into_response(),
             Err(e) => {
-                tracing::warn!(error = %e, "termgw: remote tunnel stop failed");
+                tracing::warn!(target: "lucarne_termgw", error = %e, "remote tunnel stop failed");
                 // M2: loopback-only control plane → safe to surface the detail.
                 (e.status_code(), e.detail().to_string()).into_response()
             }
@@ -819,7 +819,7 @@ async fn http_create(
         Ok(desc) => (StatusCode::CREATED, Json(desc)).into_response(),
         // SEC-007: generic client message; detail logged server-side only.
         Err(e) => {
-            tracing::warn!(error = %e, "termgw: session create failed");
+            tracing::warn!(target: "lucarne_termgw", error = %e, "session create failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
         }
     }
@@ -835,7 +835,7 @@ async fn http_close(
         Err(lucarne_rmux::MonitorError::NotFound(_)) => StatusCode::NOT_FOUND.into_response(),
         // SEC-007: generic client message; detail logged server-side only.
         Err(e) => {
-            tracing::warn!(%id, error = %e, "termgw: session close failed");
+            tracing::warn!(target: "lucarne_termgw", %id, error = %e, "session close failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
         }
     }
@@ -902,12 +902,12 @@ async fn check_ws_ticket(
             None => {
                 // SEC-011: audit a rejected ws ticket (used/expired/forged). The
                 // ticket value itself is never logged.
-                tracing::info!("termgw: rejected ws upgrade — invalid or used ticket");
+                tracing::info!(target: "lucarne_termgw", "rejected ws upgrade — invalid or used ticket");
                 Err((StatusCode::UNAUTHORIZED, "invalid or missing ws ticket").into_response())
             }
         },
         None => {
-            tracing::info!("termgw: rejected ws upgrade — missing ticket");
+            tracing::info!(target: "lucarne_termgw", "rejected ws upgrade — missing ticket");
             Err((StatusCode::UNAUTHORIZED, "invalid or missing ws ticket").into_response())
         }
     }
@@ -924,9 +924,9 @@ fn acquire_ws_permit(s: &AppState) -> Result<tokio::sync::OwnedSemaphorePermit, 
     match s.ws_pool.try_acquire() {
         Some(permit) => Ok(permit),
         None => {
-            tracing::warn!(
+            tracing::warn!(target: "lucarne_termgw",
                 cap = s.limits.max_ws_connections,
-                "termgw: ws connection cap reached; rejecting upgrade with 503"
+                "ws connection cap reached; rejecting upgrade with 503"
             );
             Err((
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -987,9 +987,9 @@ async fn agent_client(
 ) {
     let conn = next_conn_seq();
     let readonly = scope.is_readonly();
-    tracing::info!(conn, %id, readonly, "termgw: agent ws connected");
+    tracing::info!(target: "lucarne_termgw", conn, %id, readonly, "agent ws connected");
     agent_client_inner(&s, &id, socket, limits, readonly).await;
-    tracing::info!(conn, %id, "termgw: agent ws disconnected");
+    tracing::info!(target: "lucarne_termgw", conn, %id, "agent ws disconnected");
 }
 
 async fn agent_client_inner(
@@ -1029,11 +1029,11 @@ async fn agent_client_inner(
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => {
-                tracing::info!(%id, "termgw: agent ws closed on max session lifetime");
+                tracing::info!(target: "lucarne_termgw", %id, "agent ws closed on max session lifetime");
                 break;
             }
             _ = idle.tick() => {
-                tracing::info!(%id, "termgw: agent ws closed on idle timeout");
+                tracing::info!(target: "lucarne_termgw", %id, "agent ws closed on idle timeout");
                 break;
             }
             inbound = rx.next() => match inbound {
@@ -1044,7 +1044,7 @@ async fn agent_client_inner(
                             // SEC-013: a prompt types into the live agent — a write.
                             // Read-only sessions may only mirror; refuse it.
                             if readonly {
-                                tracing::info!(%id, "termgw: refused agent prompt on read-only session");
+                                tracing::info!(target: "lucarne_termgw", %id, "refused agent prompt on read-only session");
                                 let _ = send_value(&mut tx, &json!({"type":"error","msg":"read-only session: prompts are not permitted"})).await;
                             } else {
                                 let text = v.get("text").and_then(Value::as_str).unwrap_or("");
@@ -1093,7 +1093,7 @@ async fn http_archive(
         Ok(a) => a,
         // SEC-007: generic client message; detail logged server-side only.
         Err(e) => {
-            tracing::warn!(%id, error = %e, "termgw: archive save failed");
+            tracing::warn!(target: "lucarne_termgw", %id, error = %e, "archive save failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
         }
     };
@@ -1337,7 +1337,7 @@ async fn send_frame(sender: &mut Sender, frame: &ServerFrame) -> bool {
     match serde_json::to_string(frame) {
         Ok(json) => sender.send(Message::Text(json.into())).await.is_ok(),
         Err(e) => {
-            tracing::warn!(error = %e, "termgw: serialize frame failed");
+            tracing::warn!(target: "lucarne_termgw", error = %e, "serialize frame failed");
             true // a serialization bug must not silently drop the connection
         }
     }
@@ -1370,7 +1370,7 @@ async fn snapshot_into(
         }
         Err(e) => {
             // SEC-007: detail logged server-side; client gets a generic message.
-            tracing::warn!(%session, error = %e, "termgw: snapshot failed");
+            tracing::warn!(target: "lucarne_termgw", %session, error = %e, "snapshot failed");
             send_frame(
                 sender,
                 &ServerFrame::Error {
@@ -1427,7 +1427,7 @@ async fn client_task(
     // credential). SEC-013: a read-only session refuses write frames.
     let conn = next_conn_seq();
     let readonly = scope.is_readonly();
-    tracing::info!(conn, readonly, "termgw: ws mirror connected");
+    tracing::info!(target: "lucarne_termgw", conn, readonly, "ws mirror connected");
 
     let (mut sender, mut receiver) = socket.split();
     let mut bcast = monitor.subscribe();
@@ -1441,7 +1441,7 @@ async fn client_task(
         sessions: monitor.sessions().await,
     };
     if !send_frame(&mut sender, &list).await {
-        tracing::info!(conn, "termgw: ws mirror disconnected");
+        tracing::info!(target: "lucarne_termgw", conn, "ws mirror disconnected");
         return;
     }
 
@@ -1455,11 +1455,11 @@ async fn client_task(
     'conn: loop {
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => {
-                tracing::info!(conn, "termgw: ws closed on max session lifetime");
+                tracing::info!(target: "lucarne_termgw", conn, "ws closed on max session lifetime");
                 break 'conn;
             }
             _ = idle.tick() => {
-                tracing::info!(conn, "termgw: ws closed on idle timeout");
+                tracing::info!(target: "lucarne_termgw", conn, "ws closed on idle timeout");
                 break 'conn;
             }
             inbound = receiver.next() => {
@@ -1468,7 +1468,7 @@ async fn client_task(
                         idle.reset();
                         // SEC-004: throttle inbound frames per connection.
                         if !frame_rate.allow() {
-                            tracing::warn!(conn, "termgw: ws inbound frame rate exceeded; closing connection");
+                            tracing::warn!(target: "lucarne_termgw", conn, "ws inbound frame rate exceeded; closing connection");
                             break 'conn;
                         }
                         match serde_json::from_str::<ClientFrame>(text.as_str()) {
@@ -1477,7 +1477,7 @@ async fn client_task(
                                 // (input / create / close) before any side effect;
                                 // mirror/control frames pass through unchanged.
                                 if readonly && is_write_frame(&frame) {
-                                    tracing::info!(conn, "termgw: refused write frame on read-only ws session");
+                                    tracing::info!(target: "lucarne_termgw", conn, "refused write frame on read-only ws session");
                                     if !send_frame(
                                         &mut sender,
                                         &ServerFrame::Error {
@@ -1500,7 +1500,7 @@ async fn client_task(
                             }
                             Err(e) => {
                                 // SEC-007: detail logged server-side; client gets generic.
-                                tracing::warn!(error = %e, "termgw: bad ws client frame");
+                                tracing::warn!(target: "lucarne_termgw", error = %e, "bad ws client frame");
                                 if !send_frame(
                                     &mut sender,
                                     &ServerFrame::Error { code: 400, msg: "bad request".to_string() },
@@ -1515,7 +1515,7 @@ async fn client_task(
                     Some(Ok(Message::Close(_))) | None => break 'conn,
                     Some(Ok(_)) => { idle.reset(); } // ping/pong/binary — ignore
                     Some(Err(e)) => {
-                        tracing::debug!(error = %e, "termgw: ws recv error");
+                        tracing::debug!(target: "lucarne_termgw", error = %e, "ws recv error");
                         break 'conn;
                     }
                 }
@@ -1538,7 +1538,7 @@ async fn client_task(
                         }
                     }
                     Err(RecvError::Lagged(n)) => {
-                        tracing::debug!(skipped = n, "termgw: client lagged; re-snapshotting subscriptions");
+                        tracing::debug!(target: "lucarne_termgw", skipped = n, "client lagged; re-snapshotting subscriptions");
                         for session in subscribed.iter().cloned().collect::<Vec<_>>() {
                             if !snapshot_into(&monitor, &mut sender, &mut differs, session).await {
                                 break 'conn;
@@ -1550,7 +1550,7 @@ async fn client_task(
             }
         }
     }
-    tracing::info!(conn, "termgw: ws mirror disconnected");
+    tracing::info!(target: "lucarne_termgw", conn, "ws mirror disconnected");
 }
 
 /// True for client frames that mutate server state (SEC-013): keystroke/text
@@ -1592,7 +1592,7 @@ async fn handle_client_frame(
         }
         ClientFrame::Input { session, event } => {
             if let Err(e) = monitor.inject(&session, event).await {
-                tracing::debug!(%session, error = %e, "termgw: inject failed");
+                tracing::debug!(target: "lucarne_termgw", %session, error = %e, "inject failed");
             }
             true
         }
@@ -1602,9 +1602,9 @@ async fn handle_client_frame(
         ClientFrame::CreateSession { title } => {
             // SEC-004: cap sessions created per connection (anti fork-bomb).
             if *sessions_created >= limits.max_sessions_per_conn {
-                tracing::warn!(
+                tracing::warn!(target: "lucarne_termgw",
                     cap = limits.max_sessions_per_conn,
-                    "termgw: per-connection session-creation cap reached"
+                    "per-connection session-creation cap reached"
                 );
                 return send_frame(
                     sender,
@@ -1626,7 +1626,7 @@ async fn handle_client_frame(
                 }
                 Err(e) => {
                     // SEC-007: detail logged server-side; client gets generic.
-                    tracing::warn!(error = %e, "termgw: ws session create failed");
+                    tracing::warn!(target: "lucarne_termgw", error = %e, "ws session create failed");
                     send_frame(sender, &ServerFrame::Error { code: 500, msg: "internal error".to_string() })
                         .await
                 }
@@ -1647,7 +1647,7 @@ async fn handle_client_frame(
             }
             Err(e) => {
                 // SEC-007: detail logged server-side; client gets generic.
-                tracing::warn!(%session, error = %e, "termgw: ws session close failed");
+                tracing::warn!(target: "lucarne_termgw", %session, error = %e, "ws session close failed");
                 send_frame(sender, &ServerFrame::Error { code: 501, msg: "internal error".to_string() })
                     .await
             }

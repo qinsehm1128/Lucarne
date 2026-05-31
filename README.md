@@ -176,6 +176,27 @@ Telegram needs Topics/thread mode for the entry chat. A private chat with the bo
 Telegram workspaces map to Forum Topics. One project gets one topic; one topic can bind one live agent session.
 - Telegram supports every WeChat feature.
 
+### Terminal monitor and the `term` CLI (optional)
+
+The terminal-monitor subsystem is feature-gated and off by default. Build the
+daemon with `--features remote` to enable it. It mirrors the sessions on your
+system-wide rmux daemon to a web terminal view, hosts a web chat view backed by
+a Lucarne agent session, and lets a session be popped into your local terminal
+and retracted again while the remote mirror keeps running.
+
+The thin `term` CLI drives the same rmux daemon and the shared archive store:
+
+```bash
+term ls                 # list terminal sessions
+term attach <id>        # pop a session into your local terminal
+term detach <id>        # retract it (the remote mirror keeps running)
+term go-public          # expose the web view through a remote-access tunnel
+```
+
+`term go-public` enumerates the built-in tunnel providers (Cloudflared-first),
+prompts for any required secret without echoing it, and prints a terminal QR of
+the login URL so a phone can reach the terminal and chat views remotely.
+
 ---
 
 ## Architecture Overview
@@ -198,6 +219,30 @@ Telegram workspaces map to Forum Topics. One project gets one topic; one topic c
     ┌──────┬──────┬──────┬──────┐
   Claude  Codex Gemini Copilot  Pi  ← Agent CLI processes
 ```
+
+### Terminal-monitor subsystem (optional, `--features remote`)
+
+A parallel subsystem that mirrors the user's system-wide rmux terminal sessions
+to a web client, plus a web chat bridge — all reachable remotely through a
+tunnel. Default daemon builds never compile or link any of it.
+
+```
+   ┌──────────────┐   ┌──────────────┐
+   │ web terminal │   │   web chat   │  ← Browser (terminal view + chat view)
+   └──────┬───────┘   └──────┬───────┘
+          │                  │
+    lucarne-termgw      lucarne-web      ← Axum ws/HTTP gateway + AgentRuntime ws bridge
+          │                  │
+    lucarne-rmux        (lucarne)        ← Live rmux-sdk binding (adapter + monitor)
+          │
+    lucarne-term                         ← rmux-free terminal vocabulary + differ + registry
+          │
+   ┌──────┴───────┐
+   │ system rmux  │   lucarne-remote     ← go-public tunnel registry (Cloudflared-first)
+   │   daemon     │
+   └──────────────┘   term CLI           ← Thin `term` CLI: list / attach / detach / go-public
+```
+
 ---
 
 ## Agent Capability Matrix
@@ -233,7 +278,7 @@ cargo +nightly test -Zbuild-dir-new-layout
 - [x] Windows support: installation docs, background execution, path / process compatibility, and release packages
 - [ ] Message modes: steer / queue
 - [ ] Split `agent-sessions` into an independent crate
-- [ ] Support remote agent environments
+- [x] Support remote agent environments: rmux terminal monitor + web chat bridge + go-public tunnel (`--features remote`)
 - [ ] More agent providers: Cursor, opencode, and more
 - [ ] More channels: Discord, Slack, Feishu, DingTalk, Matrix, QQ, and more
 - [ ] ....
