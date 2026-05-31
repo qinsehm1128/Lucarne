@@ -194,7 +194,7 @@ pub fn recent_sessions(limit: usize) -> Vec<RecentSession> {
             }
         }
     }
-    all.sort_by(|a, b| b.modified.cmp(&a.modified));
+    all.sort_by_key(|b| std::cmp::Reverse(b.modified));
     all.truncate(limit);
     all
 }

@@ -58,8 +58,10 @@ pub struct Cell {
 /// cleanly in JSON (an `untagged` enum cannot distinguish the unit variants).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum Color {
     /// Terminal default color (raw encoding 8).
+    #[default]
     Default,
     /// Explicit no-color (raw -1).
     None,
@@ -77,11 +79,6 @@ pub enum Color {
     Encoded(i32),
 }
 
-impl Default for Color {
-    fn default() -> Self {
-        Color::Default
-    }
-}
 
 bitflags::bitflags! {
     /// Cell style attributes. Bit values are aligned to `rmux_sdk::PaneAttributes`

@@ -14,6 +14,7 @@
 //! subsystem's spawn-after-gateway + shutdown wiring (`main.rs`).
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -69,6 +70,12 @@ pub struct RemoteRuntimeConfig {
     /// [`ProviderConfig`] without interpreting any field — provider-specific
     /// structure stays at the provider boundary.
     pub provider_fields: std::collections::BTreeMap<String, String>,
+    /// Cold-daemon lazy start (this change): when `true` the daemon auto-starts
+    /// the configured tunnel at boot (the historical `remote.enabled:true`
+    /// behaviour — gateway + monitor + tunnel come up immediately). When `false`
+    /// the control plane is still served from boot but the gateway / rmux monitor
+    /// / tunnel stay idle until the first `term go-public` (`/api/remote/start`).
+    pub autostart: bool,
 }
 
 impl RemoteRuntimeConfig {
@@ -107,9 +114,13 @@ impl RemoteRuntimeConfig {
 /// Handle returned to `run_daemon` after the subsystem is up — carries the
 /// fields the daemon logs (`provider`, `public_url`). The live tunnel + control
 /// plane live in the spawned tasks / the `Arc<DaemonRemoteControl>`.
+///
+/// `public_url` is `Some` only when the tunnel was actually started (autostart),
+/// and `None` when the control plane is up but the tunnel is still idle (cold
+/// daemon waiting for `term go-public`).
 pub struct RemoteSubsystem {
     pub provider: String,
-    pub public_url: String,
+    pub public_url: Option<String>,
 }
 
 /// The daemon's [`RemoteControl`] implementation: it owns the tunnel lifecycle
@@ -131,6 +142,20 @@ struct DaemonRemoteControl {
     /// Tunnel lifecycle state machine (H4). Guards transitions; provider awaits
     /// happen with this lock released.
     state: Mutex<TunnelState>,
+    /// Cold-daemon lazy gateway (this change): the gateway (rmux monitor + termgw
+    /// router + merged chat + bind/serve) is NOT brought up at boot when
+    /// `autostart` is false. The auth state + shared ws pool + web asset dir are
+    /// built once at startup (so the control plane can return a token from boot)
+    /// and held here so the FIRST `start()` can lazily connect rmux + bind the
+    /// gateway. `ensure_gateway` runs that wiring at most once (`gateway_up`).
+    auth: AuthState,
+    ws_pool: WsConnectionPool,
+    web_dir: PathBuf,
+    /// Once-guard for the lazy gateway bring-up. `false` until `ensure_gateway`
+    /// has connected rmux + bound + spawned the gateway serve task; then `true`.
+    /// H4 discipline: the heavy work (rmux connect / bind / serve) runs with this
+    /// lock RELEASED; the lock is only held to read/set the flag.
+    gateway_up: Mutex<bool>,
 }
 
 /// Tunnel lifecycle (H4). `Starting` / `Stopping` are transient markers so a
@@ -379,12 +404,128 @@ impl RemoteControl for DaemonRemoteControl {
 }
 
 impl DaemonRemoteControl {
+    /// Lazily bring up the gateway exactly once (cold-daemon lazy start).
+    ///
+    /// On a cold daemon (`autostart:false`) the control plane is served from boot
+    /// but the rmux monitor + termgw gateway are NOT — the first `start()` (from
+    /// `term go-public`, or autostart) runs this. It connects the system rmux
+    /// monitor, builds the termgw router on the shared ws pool (merging the
+    /// ticket-gated `lucarne-web` `/chat` when available), binds the loopback
+    /// gateway, and spawns its serve task.
+    ///
+    /// H4 discipline: the `gateway_up` lock is NEVER held across the heavy awaits
+    /// (rmux connect / bind / serve). Phase 1 reads the flag under the lock and
+    /// returns early if already up; phase 2 does the work lock-free; phase 3
+    /// re-acquires the lock, re-checks the flag (a concurrent caller may have
+    /// raced us), and only commits the spawn + sets the flag when it is still
+    /// down — otherwise it discards the duplicate listener so we never double-bind
+    /// or double-serve.
+    ///
+    /// An rmux connect / bind failure returns [`RemoteControlError::Backend`] so
+    /// the CLI gets a clear error WITHOUT crashing the daemon (the control plane
+    /// stays up; a later `term go-public` can retry once rmux is available).
+    async fn ensure_gateway(&self) -> Result<(), RemoteControlError> {
+        // Phase 1 (locked): already up → nothing to do.
+        if *self.gateway_up.lock().await {
+            return Ok(());
+        }
+
+        // Phase 2 (lock-free): connect rmux, build + bind the gateway. None of
+        // these awaits hold the `gateway_up` lock (H4).
+        let monitor = Arc::new(
+            RmuxMonitor::connect()
+                .await
+                .map_err(|e| RemoteControlError::Backend(format!("rmux connect failed: {e}")))?,
+        );
+        let adopted = monitor
+            .adopt_all()
+            .await
+            .map_err(|e| RemoteControlError::Backend(format!("rmux adopt failed: {e}")))?;
+        info!(
+            sessions = adopted.len(),
+            "lucarned remote: adopted system rmux sessions"
+        );
+
+        // SEC-001 / H1 / C1: the merged `/chat` ws does NOT inherit the gateway
+        // router's auth/limits across `merge`, so we build it with `router_gated`
+        // — the SAME single-use ticket auth, the SAME shared ws pool (one global
+        // cap), idle/lifetime close, inbound frame rate, AND read-only scope as
+        // termgw's ws routes. Best-effort: a chat init failure serves terminal-only.
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| ".".to_string());
+        let chat_router = match WebChat::new(cwd, None).await {
+            Ok(chat) => Some(lucarne_web::router_gated(
+                chat,
+                self.auth.clone(),
+                self.ws_pool.clone(),
+            )),
+            Err(e) => {
+                warn!(error = %e, "lucarned remote: web chat bridge unavailable; serving terminal-only");
+                None
+            }
+        };
+
+        // H1: build the gateway router on the SAME shared ws pool the chat router
+        // uses, so `/ws` + `/agent` + `/chat` share one global connection cap.
+        let mut app = lucarne_termgw::router_with_pool(
+            monitor,
+            self.web_dir.clone(),
+            self.auth.clone(),
+            self.ws_pool.clone(),
+        );
+        if let Some(chat) = chat_router {
+            app = app.merge(chat);
+        }
+        let listener = tokio::net::TcpListener::bind(self.config.gateway_addr)
+            .await
+            .map_err(|e| {
+                RemoteControlError::Backend(format!(
+                    "gateway bind {} failed: {e}",
+                    self.config.gateway_addr
+                ))
+            })?;
+        let bound = listener
+            .local_addr()
+            .map_err(|e| RemoteControlError::Backend(format!("gateway local_addr failed: {e}")))?;
+
+        // Phase 3 (locked): re-check the flag — a concurrent caller may have won
+        // the race while we were connecting/binding lock-free. If so, discard this
+        // duplicate listener (drop it) so we never double-serve the same port.
+        {
+            let mut guard = self.gateway_up.lock().await;
+            if *guard {
+                drop(listener);
+                return Ok(());
+            }
+            tokio::spawn(async move {
+                if let Err(err) = axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                {
+                    warn!(error = %err, "lucarned remote gateway stopped");
+                }
+            });
+            *guard = true;
+        }
+        info!(addr = %bound, "lucarned remote gateway listening (loopback)");
+        Ok(())
+    }
+
     /// Resolve provider + config and spawn the tunnel (lock-free). H6a: log the
     /// provider's own `warnings(cfg)` instead of special-casing a provider id.
     async fn do_start(
         &self,
         params: RemoteStartParams,
     ) -> Result<TunnelHandle, RemoteControlError> {
+        // Cold-daemon lazy start: bring up the gateway (rmux monitor + termgw
+        // router + bind) on demand BEFORE the tunnel targets it. Idempotent +
+        // once-guarded; an rmux/bind failure is a typed Backend error (the daemon
+        // does not crash; the control plane stays up for a retry).
+        self.ensure_gateway().await?;
+
         // G3: a CLI-supplied provider id overrides the daemon's configured one;
         // absent → fall back to the pre-configured provider.
         let provider_id = params
@@ -466,9 +607,20 @@ fn build_auth(
     }
 }
 
-/// Start the remote-access subsystem: connect the rmux monitor, build the
-/// default-deny auth state, serve the loopback gateway (wiring the control
-/// plane), auto-start the configured tunnel, and register graceful shutdown.
+/// Start the remote-access subsystem: build the default-deny auth state, serve
+/// the loopback-only control plane (so `term go-public` can reach the daemon from
+/// boot), and — only when `config.autostart` — bring up the gateway + tunnel.
+///
+/// Cold-daemon lazy start (this change): the control plane (SEC-002, port 7801)
+/// is ALWAYS served, even when the tunnel is idle, so `/api/remote/status`
+/// returns the access token + `running:false` from startup and `term go-public`
+/// is never refused with a connection-refused. The rmux monitor + termgw gateway
+/// + tunnel are brought up lazily on the first `start()` (via
+/// [`DaemonRemoteControl::ensure_gateway`]) — either from `term go-public` or, when
+/// `autostart` is set (`remote.enabled:true`), from a single `control.start()`
+/// here at boot (preserving the historical behaviour). An rmux-less environment
+/// therefore no longer crashes the daemon: the control plane stays up and a
+/// `start()` returns a clear [`RemoteControlError`] instead.
 ///
 /// Returns the [`RemoteSubsystem`] handle (for daemon logging). Tunnel + gateway
 /// run in spawned tasks; the tunnel is stopped when `shutdown` fires.
@@ -516,86 +668,40 @@ pub async fn spawn_remote_subsystem(
         .unwrap_or_default();
     let auth = auth.with_forwarded_identity(forwarded_policy);
 
-    // Terminal monitor (mirrors the system rmux daemon) — the gateway surface.
-    let monitor = Arc::new(RmuxMonitor::connect().await?);
-    let adopted = monitor.adopt_all().await?;
-    info!(sessions = adopted.len(), "lucarned remote: adopted system rmux sessions");
-
-    // H1: ONE shared ws-connection pool drives every ws route on the port — the
-    // termgw `/ws` + `/agent` AND the merged `lucarne-web` `/chat` — so a single
-    // `max_ws_connections` cap (plus the same idle/lifetime/inbound-frame-rate
-    // limits) governs all of them. `/chat` previously bypassed all limits.
+    // H1: ONE shared ws-connection pool drives every ws route on the gateway port
+    // — the termgw `/ws` + `/agent` AND the merged `lucarne-web` `/chat` — so a
+    // single `max_ws_connections` cap (plus the same idle/lifetime/inbound-frame-
+    // rate limits) governs all of them. Built here so it is shared by the lazy
+    // gateway bring-up (`ensure_gateway`).
     let ws_pool = WsConnectionPool::new(GatewayLimits::default());
 
-    // Web chat bridge rooted at the daemon working dir (the dual-mode web app's
-    // chat half). Best-effort: a chat init failure must not block the gateway.
-    //
-    // SEC-001 / H1 / C1: the merged `/chat` ws does NOT inherit the gateway
-    // router's auth/limits across `merge`, so we build it with `router_gated`,
-    // which routes the chat ws through the SAME single-use ticket auth, the SAME
-    // shared connection pool (one global cap), idle/lifetime close, inbound frame
-    // rate, AND read-only access scope as termgw's ws routes.
-    let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| ".".to_string());
-    let chat_router = match WebChat::new(cwd, None).await {
-        Ok(chat) => Some(lucarne_web::router_gated(
-            chat,
-            auth.clone(),
-            ws_pool.clone(),
-        )),
-        Err(e) => {
-            warn!(error = %e, "lucarned remote: web chat bridge unavailable; serving terminal-only");
-            None
-        }
-    };
+    // Web asset dir served by the gateway (resolved here so `ensure_gateway` does
+    // not re-read the env per start).
+    let web_dir = std::path::PathBuf::from(
+        std::env::var("LUCARNED_REMOTE_WEB").unwrap_or_else(|_| DEFAULT_WEB_DIR.to_string()),
+    );
+    let control_addr = config.control_addr;
 
     // The daemon owns the tunnel lifecycle; a SEPARATE loopback control listener
     // (SEC-002) forwards `/api/remote/*` to it. H4: the control starts in the
-    // Idle state; its state machine runs provider awaits lock-free.
+    // Idle state; its state machine runs provider awaits lock-free. The gateway
+    // (rmux monitor + termgw router + bind) is NOT connected here — it is brought
+    // up lazily on the first `start()` (cold-daemon lazy start).
     let control = Arc::new(DaemonRemoteControl {
         registry,
         config: config.clone(),
         access_token: access_token.clone(),
         state: Mutex::new(TunnelState::Idle),
+        auth,
+        ws_pool,
+        web_dir,
+        gateway_up: Mutex::new(false),
     });
-
-    // Serve the gateway bound to loopback (L3), default-deny enforced before
-    // bind. Build the router so we can merge the (ticket-gated) chat bridge onto
-    // one port (the single converter), matching the `webdev` example.
-    //
-    // SEC-002: the gateway router carries NO `/api/remote/*` control plane — that
-    // moves to a distinct loopback listener below. The tunnel only ever targets
-    // `gateway_addr`, so the control plane (and the `access_token` it returns) is
-    // unreachable from anyone on the tunnel.
-    let web_dir = std::path::PathBuf::from(
-        std::env::var("LUCARNED_REMOTE_WEB").unwrap_or_else(|_| DEFAULT_WEB_DIR.to_string()),
-    );
-    let gateway_addr = config.gateway_addr;
-    let control_addr = config.control_addr;
-    // H1: build the gateway router on the SAME shared ws pool the chat router
-    // uses, so `/ws` + `/agent` + `/chat` share one global connection cap.
-    let mut app = lucarne_termgw::router_with_pool(monitor, web_dir, auth, ws_pool.clone());
-    if let Some(chat) = chat_router {
-        app = app.merge(chat);
-    }
-    let listener = tokio::net::TcpListener::bind(gateway_addr).await?;
-    let bound = listener.local_addr()?;
-    tokio::spawn(async move {
-        if let Err(err) = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        {
-            warn!(error = %err, "lucarned remote gateway stopped");
-        }
-    });
-    info!(addr = %bound, "lucarned remote gateway listening (loopback)");
 
     // SEC-002: serve the loopback-only control plane on its OWN distinct port the
     // tunnel never targets. This separation — not peer-IP — is the trust boundary
-    // that keeps `/api/remote/*` (and the `access_token`) off the tunnel.
+    // that keeps `/api/remote/*` (and the `access_token`) off the tunnel. Always
+    // served (even on a cold daemon) so `term go-public` can reach the daemon.
     let control_for_plane = control.clone() as Arc<dyn RemoteControl>;
     let control_listener = tokio::net::TcpListener::bind(control_addr).await?;
     let control_bound = control_listener.local_addr()?;
@@ -615,22 +721,31 @@ pub async fn spawn_remote_subsystem(
     });
     info!(addr = %control_bound, "lucarned remote control plane listening (loopback-only, off-tunnel)");
 
-    // Auto-start the configured tunnel (the CLI may also start/stop it later via
-    // the loopback control plane). The daemon's auto-start uses its
-    // pre-configured provider + fields — empty params (G3 override path is the
+    // Autostart (historical `remote.enabled:true` behaviour): bring up the
+    // gateway + tunnel immediately via one `start()` (the SAME lazy path
+    // `term go-public` uses — `ensure_gateway` then `provider.start`). When
+    // `autostart` is false the control plane is ready and the tunnel stays idle
+    // until the first `term go-public`. The daemon's auto-start uses its
+    // pre-configured provider + fields (empty params — the G3 override path is the
     // CLI's `/api/remote/start` body).
-    let status = control
-        .start(RemoteStartParams::default())
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-    let public_url = status
-        .public_url
-        .clone()
-        .ok_or("remote tunnel started without a public URL")?;
-    let provider = status
-        .provider
-        .clone()
-        .unwrap_or_else(|| config.provider.clone());
+    let public_url = if config.autostart {
+        let status = control
+            .start(RemoteStartParams::default())
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        Some(
+            status
+                .public_url
+                .clone()
+                .ok_or("remote tunnel started without a public URL")?,
+        )
+    } else {
+        info!(
+            "lucarned remote: control plane ready, tunnel idle — run `term go-public` to open public access"
+        );
+        None
+    };
+    let provider = config.provider.clone();
 
     // Graceful shutdown: when the daemon signals shutdown, stop the tunnel so the
     // provider process (e.g. cloudflared) is reaped (mirrors the health subsystem

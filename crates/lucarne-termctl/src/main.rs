@@ -524,9 +524,10 @@ fn collect_fields(
 }
 
 /// POST `/api/remote/start` to the daemon loopback control plane and parse the
-/// `RemoteControlStatus` response. The daemon owns the provider config; the
-/// collected fields are sent as a best-effort JSON body for forward
-/// compatibility (the current loopback handler ignores the body).
+/// `RemoteControlStatus` response. The CLI sends the chosen provider id + that
+/// provider's fields as the JSON body ([`RemoteStartParams`]); the daemon uses
+/// them to override / merge its pre-configured tunnel (G3) and, on a cold daemon,
+/// lazily brings the gateway + tunnel up on this first call.
 fn call_remote_start(
     plan: &GoPublicPlan,
 ) -> Result<lucarne_remote_status::RemoteStartStatus, String> {

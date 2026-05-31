@@ -209,12 +209,13 @@ async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
             ));
     lucarne::memory_profile_snapshot!("lucarned.main.after_register_adapters");
 
-    // H5: resolve the remote-access config BEFORE the idle-exit decision. The
-    // daemon must not exit idle when ONLY the remote subsystem is enabled (no
-    // channels, no health) — otherwise the remote tunnel would never start. This
-    // is computed before the idle check and threaded into it below. In a default
-    // build (no `remote` feature) there is no remote subsystem, so this is always
-    // "absent" and the idle-exit condition is unchanged.
+    // H5 + cold-daemon lazy start: resolve the remote-access config BEFORE the
+    // idle-exit decision. In a `--features remote` build `remote_config_from_config`
+    // now ALWAYS returns `Some` (the control plane is served from boot — lazy
+    // start), so `remote_enabled` is true and the daemon never idle-exits: the
+    // control plane must stay up for `term go-public`. In a default build (no
+    // `remote` feature) there is no remote subsystem, so this is always "absent"
+    // and the idle-exit condition is unchanged.
     #[cfg(feature = "remote")]
     let remote_cfg = remote_config_from_config(&file_config)?;
     #[cfg(feature = "remote")]
@@ -287,24 +288,30 @@ async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Remote-access subsystem (Locked decision L6: daemon owns the tunnel
-    // lifecycle). Mirrors the health spawn block above: gated by config
-    // `remote.enabled` (resolved into `remote_cfg` BEFORE the idle-exit check —
-    // H5), started AFTER the gateway/adapters are up, and wired to the daemon
-    // shutdown signal so the tunnel is torn down gracefully. The whole block is
-    // compiled out unless the `remote` cargo feature is on, so the default daemon
-    // build pulls none of the remote crates.
+    // lifecycle). Cold-daemon lazy start: the control plane (port 7801) is served
+    // from boot whenever the `remote` feature is built, regardless of
+    // `remote.enabled` — `remote_config_from_config` now always resolves to `Some`
+    // (resolved BEFORE the idle-exit check — H5). The gateway + tunnel come up
+    // lazily on the first `term go-public`, OR immediately when `autostart`
+    // (`remote.enabled:true`) is set. Wired to the daemon shutdown signal so a
+    // running tunnel is torn down gracefully. The whole block is compiled out
+    // unless the `remote` cargo feature is on, so the default daemon build pulls
+    // none of the remote crates.
     #[cfg(feature = "remote")]
     if let Some(remote_cfg) = remote_cfg {
         match remote::spawn_remote_subsystem(remote_cfg, shutdown_tx.subscribe()).await {
-            Ok(handle) => {
-                info!(
+            Ok(handle) => match handle.public_url {
+                Some(public_url) => info!(
                     provider = %handle.provider,
-                    public_url = %handle.public_url,
+                    public_url = %public_url,
                     "lucarned remote tunnel started"
-                );
-            }
+                ),
+                None => info!(
+                    "lucarned remote control plane ready; tunnel idle — run `term go-public` to open public access"
+                ),
+            },
             Err(err) => {
-                warn!(error = %err, "lucarned remote tunnel failed to start");
+                warn!(error = %err, "lucarned remote subsystem failed to start");
             }
         }
     }
@@ -832,9 +839,15 @@ fn health_addr_from_config(
 
 /// Resolve the remote-access runtime config from the file config + env overrides.
 ///
-/// Mirrors [`health_addr_from_config`]: an `enabled` gate (env
-/// `LUCARNED_REMOTE_ENABLED` overrides `remote.enabled`, default-off), returning
-/// `Ok(None)` when remote is off so the daemon never starts a tunnel unbidden.
+/// Cold-daemon lazy start (this change): in a `--features remote` build this now
+/// ALWAYS returns `Ok(Some(config))` — the control plane (port 7801) is served
+/// from boot regardless of `remote.enabled` so `term go-public` can reach the
+/// daemon and lazily open the tunnel. The `enabled` gate (env
+/// `LUCARNED_REMOTE_ENABLED` overrides `remote.enabled`, default-off) now drives
+/// `RemoteRuntimeConfig::autostart`: `true` → bring the gateway + tunnel up at
+/// boot (the historical behaviour); `false` → control plane ready, tunnel idle
+/// until `term go-public`.
+///
 /// The gateway bind address is parsed + hardened to loopback via termgw
 /// `parse_gateway_addr` (Locked decision L3). Env overrides:
 /// `LUCARNED_REMOTE_ENABLED`, `LUCARNED_REMOTE_PROVIDER`,
@@ -845,15 +858,15 @@ fn health_addr_from_config(
 fn remote_config_from_config(
     config: &LucarnedFileConfig,
 ) -> Result<Option<remote::RemoteRuntimeConfig>, Box<dyn std::error::Error>> {
-    let enabled = std::env::var("LUCARNED_REMOTE_ENABLED")
+    // `enabled` no longer gates whether the subsystem starts — it drives
+    // autostart. A feature-build always serves the control plane (lazy start), so
+    // `remote_config_from_config` always resolves to `Some`.
+    let autostart = std::env::var("LUCARNED_REMOTE_ENABLED")
         .ok()
         .as_deref()
         .and_then(parse_bool)
         .or(config.remote.enabled)
         .unwrap_or(false);
-    if !enabled {
-        return Ok(None);
-    }
 
     let provider = std::env::var("LUCARNED_REMOTE_PROVIDER")
         .ok()
@@ -961,6 +974,9 @@ fn remote_config_from_config(
         // `cloudflared` provider; the generic `remote.providers.<provider>` map
         // is merged OVER it (new config wins). Empty values are dropped.
         provider_fields: resolve_provider_fields(&config.remote, &provider),
+        // Cold-daemon lazy start: `remote.enabled` now drives autostart (bring up
+        // the gateway + tunnel at boot) rather than whether the subsystem exists.
+        autostart,
     }))
 }
 
@@ -2223,7 +2239,9 @@ remote:
     #[cfg(feature = "remote")]
     #[test]
     fn remote_config_requires_enabled_gate_and_honors_env() {
-        // Default (no remote section) → disabled → None.
+        // Cold-daemon lazy start: a feature-build ALWAYS resolves to `Some` (the
+        // control plane is served from boot); `remote.enabled` now drives
+        // `autostart`, not whether the subsystem exists.
         with_env(
             &[
                 ("LUCARNED_REMOTE_ENABLED", None),
@@ -2234,13 +2252,25 @@ remote:
                 ("LUCARNED_REMOTE_INSECURE", None),
             ],
             || {
+                // Default (no remote section) → still Some, with autostart=false
+                // (the control plane is up but the tunnel stays idle).
                 let default_config = LucarnedFileConfig::default();
-                assert!(remote_config_from_config(&default_config)
+                let resolved = remote_config_from_config(&default_config)
                     .expect("default remote config")
-                    .is_none());
+                    .expect("feature-build always resolves to Some (lazy start)");
+                assert!(
+                    !resolved.autostart,
+                    "remote disabled (default) → control plane ready, tunnel idle (autostart=false)"
+                );
+                // The control info is still resolved so `term go-public` works.
+                assert_eq!(
+                    resolved.control_addr,
+                    DEFAULT_REMOTE_CONTROL_ADDR.parse().unwrap()
+                );
 
                 // Enabled in file, defaults fill provider + loopback gateway addr
-                // + the distinct off-tunnel control addr (SEC-002).
+                // + the distinct off-tunnel control addr (SEC-002), and autostart
+                // is true.
                 let enabled = LucarnedFileConfig::from_yaml_str(
                     r#"
 remote:
@@ -2251,6 +2281,7 @@ remote:
                 let resolved = remote_config_from_config(&enabled)
                     .expect("enabled remote config")
                     .expect("enabled → Some");
+                assert!(resolved.autostart, "remote.enabled:true → autostart=true");
                 assert_eq!(resolved.provider, DEFAULT_REMOTE_PROVIDER);
                 assert_eq!(
                     resolved.gateway_addr,
@@ -2267,7 +2298,8 @@ remote:
             },
         );
 
-        // Env overrides win over file values (and can enable a disabled file).
+        // Env overrides win over file values (and can enable autostart even when
+        // the file disables it).
         with_env(
             &[
                 ("LUCARNED_REMOTE_ENABLED", Some("true")),
@@ -2292,6 +2324,10 @@ remote:
                 let resolved = remote_config_from_config(&disabled_file)
                     .expect("env-enabled remote config")
                     .expect("env enabled → Some");
+                assert!(
+                    resolved.autostart,
+                    "LUCARNED_REMOTE_ENABLED=true overrides remote.enabled:false → autostart=true"
+                );
                 assert_eq!(resolved.gateway_addr, "127.0.0.1:7900".parse().unwrap());
                 // No control addr configured → derived as gateway port + 1.
                 assert_eq!(resolved.control_addr, "127.0.0.1:7901".parse().unwrap());
@@ -2583,9 +2619,10 @@ logging:
         assert!(idle_exit < http_client);
     }
 
-    // H5: the remote config is resolved BEFORE the idle-exit decision and, when
-    // only the remote subsystem is enabled (no channels, no health), it resolves
-    // to `Some` so `remote_enabled` is true and the daemon does NOT idle-exit.
+    // H5 + cold-daemon lazy start: the remote config is resolved BEFORE the
+    // idle-exit decision and, in a feature-build, ALWAYS resolves to `Some` (the
+    // control plane is served from boot — lazy start) so `remote_enabled` is true
+    // and the daemon does NOT idle-exit.
     #[cfg(feature = "remote")]
     #[test]
     fn remote_only_config_keeps_daemon_from_idle_exit() {
@@ -2608,8 +2645,9 @@ logging:
             "remote config must be resolved before the idle-exit decision (H5)"
         );
 
-        // Behavioral: a remote-only config (no health, no channels) resolves to
-        // Some → remote_enabled true → no idle exit.
+        // Behavioral: even a remote-disabled config (no health, no channels)
+        // resolves to Some in a feature-build (cold-daemon lazy start: the control
+        // plane is served from boot) → remote_enabled true → no idle exit.
         with_env(
             &[
                 ("LUCARNED_REMOTE_ENABLED", None),
@@ -2630,11 +2668,29 @@ remote:
                 assert!(health_addr_from_config(&remote_only)
                     .expect("health addr")
                     .is_none());
-                // Remote IS enabled → Some → the idle-exit guard's `!remote_enabled`
-                // is false, so the daemon stays up to start the tunnel.
+                // Remote autostart on → Some → the idle-exit guard's
+                // `!remote_enabled` is false, so the daemon stays up.
                 assert!(remote_config_from_config(&remote_only)
                     .expect("remote config")
                     .is_some());
+
+                // Cold daemon (remote disabled): STILL resolves to Some so the
+                // control plane is up and `term go-public` can reach it — the
+                // daemon must not idle-exit even with the tunnel idle.
+                let cold = LucarnedFileConfig::from_yaml_str(
+                    r#"
+remote:
+  enabled: false
+"#,
+                )
+                .expect("parse cold remote config");
+                let resolved = remote_config_from_config(&cold)
+                    .expect("cold remote config")
+                    .expect("feature-build resolves to Some even when disabled");
+                assert!(
+                    !resolved.autostart,
+                    "remote.enabled:false → control plane ready, tunnel idle"
+                );
             },
         );
     }
