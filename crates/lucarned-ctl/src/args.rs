@@ -9,10 +9,6 @@ pub enum Command {
     Paths,
     Doctor,
     Update,
-    /// Launch the interactive full-screen TUI (only available in `lucarned`
-    /// builds with the `tui` feature; the no-feature path returns a clear
-    /// "rebuild with --features tui" error).
-    Tui,
     Autostart(AutostartCommand),
 }
 
@@ -59,7 +55,6 @@ fn parse_first(first: OsString, rest: Vec<OsString>) -> Result<Command, ParseErr
         "paths" => require_no_args(Command::Paths, rest),
         "doctor" => require_no_args(Command::Doctor, rest),
         "update" => require_no_args(Command::Update, rest),
-        "tui" => require_no_args(Command::Tui, rest),
         "autostart" => parse_autostart(rest),
         other => Err(ParseError::new(format!("unknown command: {other}"))),
     }
@@ -145,7 +140,6 @@ Usage:\n\
   lucarned init                    Configure lucarned interactively\n\
   lucarned doctor                  Diagnose install and runtime state\n\
   lucarned update                  Check latest Lucarne release status\n\
-  lucarned tui                     Launch the interactive terminal dashboard\n\
   lucarned paths                   Print resolved paths\n\
   lucarned autostart install [--start] [--bin PATH]\n\
   lucarned autostart uninstall [--stop]\n\
@@ -181,7 +175,6 @@ mod tests {
             parse_words(&["lucarned", "update"]).unwrap(),
             Command::Update
         );
-        assert_eq!(parse_words(&["lucarned", "tui"]).unwrap(), Command::Tui);
         assert_eq!(
             parse_words(&["lucarned", "--version"]).unwrap(),
             Command::Version

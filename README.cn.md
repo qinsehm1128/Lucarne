@@ -176,36 +176,6 @@ Telegram 入口 chat 需要开启 Topics/Thread mode。可以直接使用 Bot �
 Telegram workspace 映射为 Forum Topic。一个项目一个 topic；一个 topic 可绑定一个 live Agent session。
 - Telegram支持WeChat所有功能
 
-### 终端监控与 `lucarned tui` 控制台（可选）
-
-终端监控子系统是 feature-gated 的，默认关闭。用 `--features remote` 构建 daemon
-即可启用。它把系统级 rmux daemon 上的会话镜像到 web 终端视图，提供一个由 Lucarne
-agent session 支撑的 web chat 视图，并允许把某个会话弹出到本地终端、再收回，而远程
-镜像保持运行。
-
-`lucarned tui` 是本地操作者的唯一交互入口：一个全屏、方向键导航的控制台，构建在
-`tui` feature（隐含 `remote`）之下，替代了旧的独立 `term` CLI。构建并启动：
-
-```bash
-cargo +nightly build --features tui      # 构建控制台
-lucarned tui                             # 启动全屏控制台
-```
-
-控制台有三个面板（`Tab` / `←` `→` 切换面板，`↑` `↓` 移动选项，`q` / `Esc` 退出）：
-
-- **Sessions（会话）** — 列出系统级 rmux 会话；`Enter` attach（把会话弹出到本地终端，
-  detach 后回到控制台），`d` detach，`k` / `Del` kill，`a` archive 到共享 archive
-  store，`r` 刷新。
-- **Go Public（对外暴露）** — `s` 启动远程接入隧道，`x` 停止，`r` 查询状态，`Enter`
-  弹出登录 URL 的高对比二维码模态，让手机能远程访问终端与 chat 视图（终端太小无法画出
-  可扫码二维码时回退为纯 URL）。
-- **Config（配置）** — 编辑远程接入 provider 字段（Cloudflared 优先），密钥字段掩码
-  显示且永不回显，保存时写回 `lucarned.yaml` 并生成带时间戳的备份。
-
-默认 daemon 构建（不带 `--features tui`）不会编译或链接任何 TUI 栈 —— 没有 `ratatui`、
-没有 `crossterm`、没有 rmux 绑定 —— 常驻 daemon 始终是纯消息桥。
-
-
 ---
 
 ## 架构概览
@@ -228,29 +198,6 @@ lucarned tui                             # 启动全屏控制台
     ┌──────┬──────┬──────┬──────┐
   Claude  Codex Gemini Copilot  Pi  ← Agent CLI 进程
 ```
-
-### 终端监控子系统（可选，`--features remote`）
-
-一个并行子系统：把用户系统级 rmux 终端会话镜像到 web 客户端，并提供一个 web
-chat 桥，全部可通过隧道远程访问。默认 daemon 构建不会编译或链接其中任何一部分。
-
-```
-   ┌──────────────┐   ┌──────────────┐
-   │ web terminal │   │   web chat   │  ← 浏览器（终端视图 + chat 视图）
-   └──────┬───────┘   └──────┬───────┘
-          │                  │
-    lucarne-termgw      lucarne-web      ← Axum ws/HTTP 网关 + AgentRuntime ws 桥
-          │                  │
-    lucarne-rmux        (lucarne)        ← 实时 rmux-sdk 绑定（adapter + monitor）
-          │
-    lucarne-term                         ← rmux-free 终端词汇 + differ + registry
-          │
-   ┌──────┴───────┐
-   │ 系统 rmux    │   lucarne-remote     ← go-public 隧道注册表（Cloudflared 优先）
-   │   daemon     │
-   └──────────────┘   lucarned tui        ← 唯一交互入口：sessions / go-public / config
-```
-
 ---
 
 ## Agent 能力矩阵
@@ -286,7 +233,7 @@ cargo +nightly test -Zbuild-dir-new-layout
 - [x] Windows 支持：补齐安装说明、后台运行、路径 / 进程兼容与发布包
 - [ ] 消息模式 steer/queue
 - [ ] agent-sessions 整理为独立crate
-- [x] 支持远程 agent 环境：rmux 终端监控 + web chat 桥 + go-public 隧道（`--features remote`）
+- [ ] 支持远程 agent 环境
 - [ ] 更多 Agent Provider：Cursor、opencode 等
 - [ ] More channels：Discord、Slack、飞书、钉钉、Matrix、QQ 等更多入口
 - [ ] ....
