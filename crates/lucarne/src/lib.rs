@@ -42,6 +42,8 @@ pub mod launcher;
 pub mod observability;
 mod provider_id;
 pub mod runtime;
+#[cfg(feature = "terminal-agent-bind")]
+pub mod terminal_agent_bind;
 pub(crate) mod time_display;
 
 pub mod testing;

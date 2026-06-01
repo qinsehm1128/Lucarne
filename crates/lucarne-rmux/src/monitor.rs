@@ -12,7 +12,7 @@
 //!
 //! ## Boundary
 //! This module names `rmux_sdk` runtime handles (`Rmux`/`Pane`/`Session`); every
-//! value it emits is the rmux-free [`lucarne_term`] vocabulary via [`crate::adapter`].
+//! value it emits is the stable terminal vocabulary re-exported by this crate.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,7 +25,7 @@ use rmux_sdk::{
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
-use lucarne_term::{
+use crate::term::{
     control_key_token, Cursor, Dims, Origin, PaneGrid, SessionDescriptor, SessionId,
     SessionRegistry, TermInput,
 };
@@ -39,7 +39,7 @@ const DEFAULT_ROWS: u16 = 32;
 /// recent `SCROLLBACK_CAPTURE_LINES` lines, never the whole pane. ADR
 /// `2026-05-30-rmux-terminal-monitor-subsystem.md` boundary rule 5 requires
 /// terminal scrollback/history reads to be bounded windows, not whole-pane scans.
-const SCROLLBACK_CAPTURE_LINES: u32 = 1000;
+pub const SCROLLBACK_CAPTURE_LINES: u32 = 1000;
 /// Fan-out buffer for mirror grid updates. A slow subscriber lags (and gets a
 /// `RecvError::Lagged`) rather than back-pressuring the source loops.
 const GRID_BROADCAST_CAP: usize = 256;
@@ -58,6 +58,14 @@ pub enum MonitorError {
 }
 
 type Result<T> = std::result::Result<T, MonitorError>;
+
+/// `rmux capture-pane -S` start argument for bounded archive/scrollback reads.
+///
+/// Keep this shared between the live gateway monitor and the TUI archive path so
+/// every terminal-history capture uses the same capped window.
+pub fn scrollback_capture_start_arg() -> String {
+    format!("-{SCROLLBACK_CAPTURE_LINES}")
+}
 
 /// A fresh full grid for one monitored pane, fanned out to mirror subscribers.
 /// (The differ that turns these into deltas lives downstream, per-client, in the
@@ -191,14 +199,19 @@ impl RmuxMonitor {
         // cheap clonable handle, so this is behavior-preserving.
         let pane = {
             let guard = self.tracked.lock().await;
-            let tracked = guard.get(id).ok_or_else(|| MonitorError::NotFound(id.clone()))?;
+            let tracked = guard
+                .get(id)
+                .ok_or_else(|| MonitorError::NotFound(id.clone()))?;
             tracked.pane.clone()
         };
         let snap = pane
             .snapshot()
             .await
             .map_err(|e| MonitorError::Rmux(format!("snapshot {id}: {e}")))?;
-        Ok((adapter::snapshot_to_grid(&snap), adapter::map_cursor(snap.cursor)))
+        Ok((
+            adapter::snapshot_to_grid(&snap),
+            adapter::map_cursor(snap.cursor),
+        ))
     }
 
     /// Inject input into a tracked pane. Resize is a hint only (#5).
@@ -209,7 +222,9 @@ impl RmuxMonitor {
         // pane cannot block snapshots/input on every other session.
         let pane = {
             let guard = self.tracked.lock().await;
-            let tracked = guard.get(id).ok_or_else(|| MonitorError::NotFound(id.clone()))?;
+            let tracked = guard
+                .get(id)
+                .ok_or_else(|| MonitorError::NotFound(id.clone()))?;
             tracked.pane.clone()
         };
         match input {
@@ -279,7 +294,7 @@ impl RmuxMonitor {
                 .map(|t| t.name.as_str().to_string())
                 .ok_or_else(|| MonitorError::NotFound(id.clone()))?
         };
-        let start = format!("-{SCROLLBACK_CAPTURE_LINES}");
+        let start = scrollback_capture_start_arg();
         let out = tokio::process::Command::new(rmux_bin())
             .args(["capture-pane", "-p", "-S", &start, "-t", &name])
             .output()
@@ -327,11 +342,11 @@ impl RmuxMonitor {
         };
 
         let cwd = pane_cwd(name.as_str());
-        let desc = self
-            .registry
-            .lock()
-            .await
-            .register_with_cwd(id.clone(), title, origin, dims, cwd);
+        let desc =
+            self.registry
+                .lock()
+                .await
+                .register_with_cwd(id.clone(), title, origin, dims, cwd);
         self.tracked.lock().await.insert(
             id.clone(),
             Tracked {
@@ -491,7 +506,10 @@ mod tests {
             "scrollback capture must be a bounded, sane window (got {SCROLLBACK_CAPTURE_LINES})"
         );
         let start = format!("-{SCROLLBACK_CAPTURE_LINES}");
-        assert_eq!(start, "-1000", "capture-pane -S start must bound the window");
+        assert_eq!(
+            start, "-1000",
+            "capture-pane -S start must bound the window"
+        );
         assert_ne!(start, "-", "must NOT capture the whole pane (-S -)");
     }
 }

@@ -1,7 +1,7 @@
 //! adapter — the sole boundary that touches `rmux_sdk` value types.
 //!
-//! Converts a captured `rmux_sdk::PaneSnapshot` into the rmux-free
-//! [`lucarne_term`] `PaneGrid` vocabulary. Field shapes are verbatim from the
+//! Converts a captured `rmux_sdk::PaneSnapshot` into the stable terminal
+//! [`crate::term::PaneGrid`] vocabulary. Field shapes are verbatim from the
 //! rmux-sdk 0.3.1 probe (verified against the installed crate source):
 //! - `PaneSnapshot { cols, rows, cells, cursor, revision }`
 //! - `PaneCell { glyph, attributes, foreground, background, underline }`
@@ -11,13 +11,13 @@
 //! - `PaneCursor { row, col, visible, style: u32 }`
 //!
 //! Keeping this the only place that names `rmux_*` value types means preview-API
-//! churn never leaks into `lucarne-term` or the web client.
+//! churn never leaks into the gateway or web client.
 
 use rmux_sdk::{PaneAttributes, PaneColor, PaneCursor, PaneSnapshot};
 
-use lucarne_term::{Cell, Color, Cursor, PaneGrid, Style};
+use crate::term::{Cell, Color, Cursor, PaneGrid, Style};
 
-/// Maps one `rmux_sdk::PaneColor` to a `lucarne_term::Color` (1:1).
+/// Maps one `rmux_sdk::PaneColor` to a terminal [`Color`] (1:1).
 ///
 /// `PaneColor` is `#[non_exhaustive]`, so the trailing arm keeps this compiling
 /// against future SDK variants. Rather than dropping an unknown color
@@ -38,14 +38,14 @@ pub fn map_color(color: PaneColor) -> Color {
     }
 }
 
-/// Maps `rmux_sdk::PaneAttributes` (raw `u16` bitset) to `lucarne_term::Style`.
+/// Maps `rmux_sdk::PaneAttributes` (raw `u16` bitset) to terminal [`Style`].
 /// Uses `from_bits_retain` so unknown/future bits survive (fix-don't-hide) — the
 /// bit layout is identical between the two types.
 pub fn map_style(attrs: PaneAttributes) -> Style {
     Style::from_bits_retain(attrs.bits())
 }
 
-/// Maps `rmux_sdk::PaneCursor` to `lucarne_term::Cursor`. rmux uses `row`/`col`
+/// Maps `rmux_sdk::PaneCursor` to terminal [`Cursor`]. rmux uses `row`/`col`
 /// (not `x`/`y`) and carries an undecoded DECSCUSR `style: u32`.
 pub fn map_cursor(cursor: PaneCursor) -> Cursor {
     Cursor {
@@ -56,7 +56,7 @@ pub fn map_cursor(cursor: PaneCursor) -> Cursor {
     }
 }
 
-/// Maps one `rmux_sdk::PaneCell` to a `lucarne_term::Cell`.
+/// Maps one `rmux_sdk::PaneCell` to terminal [`Cell`].
 fn map_cell(cell: &rmux_sdk::PaneCell) -> Cell {
     Cell {
         text: cell.glyph.text.clone(),
@@ -104,9 +104,14 @@ mod tests {
         };
         let blank = PaneCell::blank();
 
-        PaneSnapshot::new(2, 2, vec![wide, pad, styled, blank], PaneCursor::new(1, 0, true, 7))
-            .expect("2x2 snapshot shape is valid")
-            .with_revision(42)
+        PaneSnapshot::new(
+            2,
+            2,
+            vec![wide, pad, styled, blank],
+            PaneCursor::new(1, 0, true, 7),
+        )
+        .expect("2x2 snapshot shape is valid")
+        .with_revision(42)
     }
 
     #[test]
@@ -115,7 +120,10 @@ mod tests {
         assert_eq!(grid.cols, 2);
         assert_eq!(grid.rows, 2);
         assert_eq!(grid.rev, 42);
-        assert_eq!(grid.cells.len(), usize::from(grid.cols) * usize::from(grid.rows));
+        assert_eq!(
+            grid.cells.len(),
+            usize::from(grid.cols) * usize::from(grid.rows)
+        );
     }
 
     #[test]
@@ -160,7 +168,10 @@ mod tests {
         assert_eq!(map_color(PaneColor::bright_ansi(4)), Color::BrightAnsi(4));
         assert_eq!(map_color(PaneColor::indexed(123)), Color::Indexed(123));
         assert_eq!(map_color(PaneColor::rgb(1, 2, 3)), Color::Rgb(1, 2, 3));
-        assert_eq!(map_color(PaneColor::Encoded { value: -5 }), Color::Encoded(-5));
+        assert_eq!(
+            map_color(PaneColor::Encoded { value: -5 }),
+            Color::Encoded(-5)
+        );
     }
 
     #[test]

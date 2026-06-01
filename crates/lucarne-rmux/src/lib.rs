@@ -1,11 +1,18 @@
-//! lucarne-rmux — the live rmux-sdk binding for the terminal-monitor subsystem.
+//! lucarne-rmux — rmux terminal capability package.
 //!
 //! Connects to the SYSTEM rmux daemon (the daemon the user's own `rmux` uses),
-//! mirrors its panes into the rmux-free [`lucarne_term`] vocabulary, and injects
-//! input. This crate (with [`adapter`]) is the ONLY place that names `rmux_sdk`,
-//! so preview-API churn never leaks into the gateway, web channel, or CLI.
+//! mirrors its panes into a stable terminal vocabulary, archives terminal
+//! sessions, and injects input. The package owns the terminal domain types plus
+//! the only `rmux_sdk` binding used by Lucarne.
 
 pub mod adapter;
+pub mod archive;
 pub mod monitor;
+pub mod term;
 
 pub use monitor::{GridUpdate, MonitorError, RmuxMonitor};
+pub use term::{
+    control_key_token, ClientFrame, Color, ControlKey, Cursor, DiffResult, Differ, Dims, GridDelta,
+    KeyMods, Origin, PaneGrid, ServerFrame, SessionDescriptor, SessionId, SessionRegistry, Style,
+    TermInput,
+};

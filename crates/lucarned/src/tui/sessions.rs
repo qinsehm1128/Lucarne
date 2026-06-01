@@ -5,7 +5,7 @@
 //! `term` CLI (Decision 2: migrate-don't-rewrite). The gateway-monitored sessions
 //! are driven through the SAME system rmux daemon via its own CLI
 //! (`list-sessions` / `attach-session` / `detach-client` / `kill-session`), plus
-//! the shared [`lucarne_archive`] store, so no control-plane IPC is introduced
+//! the shared [`lucarne_rmux::archive`] store, so no control-plane IPC is introduced
 //! (Decision 5).
 //!
 //! On top of those primitives this module hosts [`SessionsPanel`]: a ratatui
@@ -18,6 +18,7 @@
 use std::io::{self, Stdout};
 use std::process::Command;
 
+use lucarne_rmux::{archive, monitor::scrollback_capture_start_arg};
 use ratatui::{backend::CrosstermBackend, widgets::ListState, Terminal};
 
 /// Operator hint shown when `rmux list-sessions` could not be reached (COR-005):
@@ -62,6 +63,15 @@ pub fn pane_cwd(name: &str) -> Option<String> {
     rmux_out(&["display-message", "-p", "-t", name, "#{pane_current_path}"])
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+fn capture_scrollback_args<'a>(start: &'a str, name: &'a str) -> [&'a str; 6] {
+    ["capture-pane", "-p", "-S", start, "-t", name]
+}
+
+fn capture_scrollback(name: &str) -> Option<String> {
+    let start = scrollback_capture_start_arg();
+    rmux_out(&capture_scrollback_args(&start, name))
 }
 
 /// Capture `rmux list-sessions` output with an EXPLICIT format (COR-006) so the
@@ -194,13 +204,13 @@ pub fn kill_session(name: &str) -> i32 {
 pub fn archive_session(name: &str) -> Result<String, String> {
     let session_id = format!("{name}:0:0");
     let cwd = pane_cwd(name);
-    let content = rmux_out(&["capture-pane", "-p", "-S", "-", "-t", name]).unwrap_or_default();
-    match lucarne_archive::save(
+    let content = capture_scrollback(name).unwrap_or_default();
+    match archive::save(
         &session_id,
         name,
         cwd.as_deref(),
         &content,
-        lucarne_archive::now_epoch(),
+        archive::now_epoch(),
     ) {
         Ok(archive_id) => {
             run(&["kill-session", "-t", name]);
@@ -485,6 +495,16 @@ mod tests {
     fn parse_sessions_empty_output_is_empty() {
         assert!(parse_sessions("").is_empty());
         assert!(parse_sessions("   \n\t\n").is_empty());
+    }
+
+    #[test]
+    fn archive_capture_args_are_bounded() {
+        let start = scrollback_capture_start_arg();
+        assert_ne!(start, "-", "TUI archive must not capture full pane history");
+        assert_eq!(
+            capture_scrollback_args(&start, "work"),
+            ["capture-pane", "-p", "-S", "-1000", "-t", "work"]
+        );
     }
 
     #[test]

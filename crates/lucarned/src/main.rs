@@ -29,9 +29,8 @@ use tracing_subscriber::{
 
 mod health;
 mod onboarding;
-#[cfg(feature = "remote")]
 mod remote;
-#[cfg(feature = "tui")]
+mod remote_cli;
 mod tui;
 
 const DEFAULT_LOG_BUFFERED_LINES: usize = 1024;
@@ -40,15 +39,12 @@ const DEFAULT_HEALTH_ADDR: &str = "127.0.0.1:7766";
 /// Default loopback bind for the remote-access gateway (Locked decision L3 — the
 /// gateway always binds loopback; the tunnel connects outbound and back in). This
 /// is the ONLY port the tunnel targets.
-#[cfg(feature = "remote")]
 const DEFAULT_REMOTE_GATEWAY_ADDR: &str = "127.0.0.1:7800";
 /// Default loopback bind for the remote-access CONTROL plane (SEC-002). A
 /// DISTINCT port the tunnel never targets; serves `/api/remote/*` and returns
 /// the `access_token`. Defaults to the gateway port + 1 when not configured.
-#[cfg(feature = "remote")]
 const DEFAULT_REMOTE_CONTROL_ADDR: &str = "127.0.0.1:7801";
 /// Default remote-access tunnel provider id.
-#[cfg(feature = "remote")]
 const DEFAULT_REMOTE_PROVIDER: &str = "cloudflared";
 
 const DEFAULT_LUCARNED_CONFIG: &str = r#"agents:
@@ -170,11 +166,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         lucarned_ctl::Command::Doctor | lucarned_ctl::Command::Update => {
             run_ctl_network_command(command).await
         }
-        // The interactive TUI owns the `tui` feature (ratatui/crossterm + the
-        // migrated term helpers). In a `--features tui` build it launches the
-        // full-screen dashboard; without the feature it falls through to
-        // `lucarned_ctl::run`, which returns a clear "rebuild with --features
-        // tui" error.
+        lucarned_ctl::Command::Remote(command) => {
+            std::thread::spawn(move || remote_cli::run_remote_command(command))
+                .join()
+                .unwrap_or_else(|_| Err("remote command thread panicked".to_string()))
+                .map_err(|err| -> Box<dyn std::error::Error> {
+                    std::io::Error::new(std::io::ErrorKind::Other, err).into()
+                })
+        }
         // The TUI is fully synchronous and uses `reqwest::blocking` for its
         // loopback control-plane calls. `reqwest::blocking` builds and drops its
         // own current-thread Tokio runtime; dropping a runtime inside this
@@ -183,7 +182,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // dedicated OS thread with no ambient runtime so the blocking client is
         // safe. The panic hook installed in `tui::run` is process-global, so a
         // panic on that thread still restores the terminal.
-        #[cfg(feature = "tui")]
         lucarned_ctl::Command::Tui => std::thread::spawn(tui::run)
             .join()
             .unwrap_or_else(|_| Err("tui thread panicked".to_string()))
@@ -232,18 +230,12 @@ async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     lucarne::memory_profile_snapshot!("lucarned.main.after_register_adapters");
 
     // H5 + cold-daemon lazy start: resolve the remote-access config BEFORE the
-    // idle-exit decision. In a `--features remote` build `remote_config_from_config`
-    // now ALWAYS returns `Some` (the control plane is served from boot — lazy
-    // start), so `remote_enabled` is true and the daemon never idle-exits: the
-    // control plane must stay up for `term go-public`. In a default build (no
-    // `remote` feature) there is no remote subsystem, so this is always "absent"
-    // and the idle-exit condition is unchanged.
-    #[cfg(feature = "remote")]
+    // idle-exit decision. `remote_config_from_config` always returns `Some` (the
+    // control plane is served from boot — lazy start), so `remote_enabled` is true
+    // and the daemon never idle-exits: the control plane must stay up for
+    // `lucarned remote start`.
     let remote_cfg = remote_config_from_config(&file_config)?;
-    #[cfg(feature = "remote")]
     let remote_enabled = remote_cfg.is_some();
-    #[cfg(not(feature = "remote"))]
-    let remote_enabled = false;
 
     if enabled_adapter_count == 0 && health_addr.is_none() && !remote_enabled {
         lucarne::memory_profile_snapshot!("lucarned.main.no_enabled_adapters");
@@ -311,17 +303,19 @@ async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
 
     // Remote-access subsystem (Locked decision L6: daemon owns the tunnel
     // lifecycle). Cold-daemon lazy start: the control plane (port 7801) is served
-    // from boot whenever the `remote` feature is built, regardless of
-    // `remote.enabled` — `remote_config_from_config` now always resolves to `Some`
-    // (resolved BEFORE the idle-exit check — H5). The gateway + tunnel come up
-    // lazily on the first `term go-public`, OR immediately when `autostart`
-    // (`remote.enabled:true`) is set. Wired to the daemon shutdown signal so a
-    // running tunnel is torn down gracefully. The whole block is compiled out
-    // unless the `remote` cargo feature is on, so the default daemon build pulls
-    // none of the remote crates.
-    #[cfg(feature = "remote")]
+    // from boot regardless of `remote.enabled` — `remote_config_from_config` always
+    // resolves to `Some` (resolved BEFORE the idle-exit check — H5). The gateway +
+    // tunnel come up lazily on the first `lucarned remote start`, OR immediately
+    // when `autostart` (`remote.enabled:true`) is set. Wired to the daemon
+    // shutdown signal so a running tunnel is torn down gracefully.
     if let Some(remote_cfg) = remote_cfg {
-        match remote::spawn_remote_subsystem(remote_cfg, shutdown_tx.subscribe()).await {
+        match remote::spawn_remote_subsystem(
+            remote_cfg,
+            core.control_plane_store(),
+            shutdown_tx.subscribe(),
+        )
+        .await
+        {
             Ok(handle) => match handle.public_url {
                 Some(public_url) => info!(
                     provider = %handle.provider,
@@ -329,7 +323,7 @@ async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
                     "lucarned remote tunnel started"
                 ),
                 None => info!(
-                    "lucarned remote control plane ready; tunnel idle — run `term go-public` to open public access"
+                    "lucarned remote control plane ready; tunnel idle — run `lucarned remote start` to open public access"
                 ),
             },
             Err(err) => {
@@ -514,9 +508,6 @@ struct LucarnedFileConfig {
     #[serde(default)]
     health: HealthFileConfig,
     #[serde(default)]
-    // Parsed in every build for config-schema stability; only read behind the
-    // `remote` feature, so the field is legitimately unused in default builds.
-    #[cfg_attr(not(feature = "remote"), allow(dead_code))]
     remote: RemoteFileConfig,
     #[serde(default)]
     updates: UpdateFileConfig,
@@ -551,9 +542,7 @@ struct HealthFileConfig {
 
 /// Remote-access (public tunnel) configuration — the `remote:` section of
 /// `lucarned.yaml`. Mirrors [`HealthFileConfig`]: a plain, serde-friendly struct
-/// that parses in **every** build (default included) so the config schema is
-/// stable; the code that actually drives a tunnel lives behind the `remote`
-/// cargo feature.
+/// that parses in every build so the config schema is stable.
 ///
 /// - `enabled` — gate (default-off, like health).
 /// - `provider` — tunnel backend id (default `"cloudflared"`).
@@ -578,7 +567,6 @@ struct HealthFileConfig {
 ///   (the legacy typed sub-map). Still parsed and merged UNDER `providers` so
 ///   existing configs keep working; new configs should use `providers`.
 #[derive(Clone, Debug, Default, Deserialize)]
-#[cfg_attr(not(feature = "remote"), allow(dead_code))]
 struct RemoteFileConfig {
     enabled: Option<bool>,
     provider: Option<String>,
@@ -608,7 +596,6 @@ struct RemoteFileConfig {
 /// `public_url`) → named tunnel with a fixed domain. `binary_path` pins an
 /// absolute `cloudflared` path (SEC-003); empty → resolve via `$PATH`.
 #[derive(Clone, Debug, Default, Deserialize)]
-#[cfg_attr(not(feature = "remote"), allow(dead_code))]
 struct CloudflareFileConfig {
     token: Option<String>,
     public_url: Option<String>,
@@ -618,7 +605,6 @@ struct CloudflareFileConfig {
 impl CloudflareFileConfig {
     /// Lower the legacy typed cloudflare block into generic `(key, value)` field
     /// entries (H6c back-compat). Only non-empty values are emitted.
-    #[cfg(feature = "remote")]
     fn as_field_entries(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
         let mut push = |key: &str, value: &Option<String>| {
@@ -866,14 +852,13 @@ fn health_addr_from_config(
 
 /// Resolve the remote-access runtime config from the file config + env overrides.
 ///
-/// Cold-daemon lazy start (this change): in a `--features remote` build this now
-/// ALWAYS returns `Ok(Some(config))` — the control plane (port 7801) is served
-/// from boot regardless of `remote.enabled` so `term go-public` can reach the
-/// daemon and lazily open the tunnel. The `enabled` gate (env
+/// Cold-daemon lazy start: this now ALWAYS returns `Ok(Some(config))` — the
+/// control plane (port 7801) is served from boot regardless of `remote.enabled`
+/// so `lucarned remote start` can reach the daemon and lazily open the tunnel. The `enabled` gate (env
 /// `LUCARNED_REMOTE_ENABLED` overrides `remote.enabled`, default-off) now drives
 /// `RemoteRuntimeConfig::autostart`: `true` → bring the gateway + tunnel up at
 /// boot (the historical behaviour); `false` → control plane ready, tunnel idle
-/// until `term go-public`.
+/// until `lucarned remote start`.
 ///
 /// The gateway bind address is parsed + hardened to loopback via termgw
 /// `parse_gateway_addr` (Locked decision L3). Env overrides:
@@ -881,12 +866,11 @@ fn health_addr_from_config(
 /// `LUCARNED_REMOTE_GATEWAY_ADDR`, `LUCARNED_REMOTE_CONTROL_ADDR`,
 /// `LUCARNED_REMOTE_AUTH_TOKEN`, `LUCARNED_REMOTE_READONLY_TOKEN`,
 /// `LUCARNED_REMOTE_INSECURE`.
-#[cfg(feature = "remote")]
 fn remote_config_from_config(
     config: &LucarnedFileConfig,
 ) -> Result<Option<remote::RemoteRuntimeConfig>, Box<dyn std::error::Error>> {
     // `enabled` no longer gates whether the subsystem starts — it drives
-    // autostart. A feature-build always serves the control plane (lazy start), so
+    // autostart. `lucarned` always serves the control plane (lazy start), so
     // `remote_config_from_config` always resolves to `Some`.
     let autostart = std::env::var("LUCARNED_REMOTE_ENABLED")
         .ok()
@@ -925,13 +909,17 @@ fn remote_config_from_config(
                 Ok(DEFAULT_REMOTE_CONTROL_ADDR.to_string())
             } else {
                 match gateway_addr.port().checked_add(1) {
-                    Some(port) => Ok(std::net::SocketAddr::new(gateway_addr.ip(), port).to_string()),
-                    None => Err::<String, Box<dyn std::error::Error>>(format!(
+                    Some(port) => {
+                        Ok(std::net::SocketAddr::new(gateway_addr.ip(), port).to_string())
+                    }
+                    None => Err::<String, Box<dyn std::error::Error>>(
+                        format!(
                         "remote.gateway_addr port {} leaves no room for a derived control port; \
                          set remote.control_addr / --control-port explicitly (L1)",
                         gateway_addr.port()
                     )
-                    .into()),
+                        .into(),
+                    ),
                 }
             }
         })?;
@@ -947,13 +935,7 @@ fn remote_config_from_config(
     let auth_token = std::env::var("LUCARNED_REMOTE_AUTH_TOKEN")
         .ok()
         .filter(|t| !t.is_empty())
-        .or_else(|| {
-            config
-                .remote
-                .auth_token
-                .clone()
-                .filter(|t| !t.is_empty())
-        });
+        .or_else(|| config.remote.auth_token.clone().filter(|t| !t.is_empty()));
 
     // SEC-013: optional read-only token. Same env/file precedence as auth_token.
     let readonly_token = std::env::var("LUCARNED_REMOTE_READONLY_TOKEN")
@@ -983,10 +965,9 @@ fn remote_config_from_config(
     }
     // SEC-013 + SEC-008: a read-only token, when set, must be equally strong.
     if let Some(token) = &readonly_token {
-        lucarne_termgw::AccessToken::from_secret_validated(token.clone())
-            .map_err(|e| -> Box<dyn std::error::Error> {
-                format!("remote.readonly_token: {e}").into()
-            })?;
+        lucarne_termgw::AccessToken::from_secret_validated(token.clone()).map_err(
+            |e| -> Box<dyn std::error::Error> { format!("remote.readonly_token: {e}").into() },
+        )?;
     }
 
     Ok(Some(remote::RemoteRuntimeConfig {
@@ -1013,7 +994,6 @@ fn remote_config_from_config(
 /// (only when `provider == "cloudflared"`, back-compat) → the generic
 /// `remote.providers.<provider>:` map. Empty values are skipped so they never
 /// shadow a value the provider would otherwise treat as absent.
-#[cfg(feature = "remote")]
 fn resolve_provider_fields(
     remote: &RemoteFileConfig,
     provider: &str,
@@ -2083,9 +2063,6 @@ health:
         );
     }
 
-    // Exercises `resolve_provider_fields`, which is `#[cfg(feature = "remote")]`;
-    // gate the test to match so the default (no-feature) build still compiles.
-    #[cfg(feature = "remote")]
     #[test]
     fn default_config_parses_including_remote_providers() {
         // Regression guard: the bootstrapped default config (which writes
@@ -2112,9 +2089,6 @@ health:
         );
     }
 
-    // Exercises `resolve_provider_fields`, which is `#[cfg(feature = "remote")]`;
-    // gate the test to match so the default (no-feature) build still compiles.
-    #[cfg(feature = "remote")]
     #[test]
     fn remote_file_config_parses_full_section() {
         // H6c: the generic `providers:` map is the new shape.
@@ -2139,8 +2113,14 @@ remote:
 
         assert_eq!(config.remote.enabled, Some(true));
         assert_eq!(config.remote.provider.as_deref(), Some("cloudflared"));
-        assert_eq!(config.remote.gateway_addr.as_deref(), Some("127.0.0.1:7810"));
-        assert_eq!(config.remote.control_addr.as_deref(), Some("127.0.0.1:7811"));
+        assert_eq!(
+            config.remote.gateway_addr.as_deref(),
+            Some("127.0.0.1:7810")
+        );
+        assert_eq!(
+            config.remote.control_addr.as_deref(),
+            Some("127.0.0.1:7811")
+        );
         assert_eq!(config.remote.auth_token.as_deref(), Some("secret-token"));
         assert_eq!(
             config.remote.readonly_token.as_deref(),
@@ -2152,10 +2132,7 @@ remote:
             .providers
             .get("cloudflared")
             .expect("cloudflared provider block");
-        assert_eq!(
-            cf.get("token").and_then(|v| v.as_deref()),
-            Some("cf-token")
-        );
+        assert_eq!(cf.get("token").and_then(|v| v.as_deref()), Some("cf-token"));
         assert_eq!(
             cf.get("public_url").and_then(|v| v.as_deref()),
             Some("https://tunnel.example.com")
@@ -2183,7 +2160,10 @@ remote:
 "#,
         )
         .expect("parse legacy remote config");
-        assert_eq!(legacy.remote.cloudflare.token.as_deref(), Some("legacy-token"));
+        assert_eq!(
+            legacy.remote.cloudflare.token.as_deref(),
+            Some("legacy-token")
+        );
         assert_eq!(
             legacy.remote.cloudflare.public_url.as_deref(),
             Some("https://legacy.example.com")
@@ -2202,7 +2182,6 @@ remote:
     // H6c: the generic provider_fields map is resolved with the legacy
     // `cloudflare:` block as a back-compat base and `providers.<id>` merged over
     // it. The daemon never interprets a field name.
-    #[cfg(feature = "remote")]
     #[test]
     fn remote_config_resolves_generic_provider_fields() {
         with_env(
@@ -2235,7 +2214,10 @@ remote:
                     Some("gen-token")
                 );
                 assert_eq!(
-                    resolved.provider_fields.get("public_url").map(String::as_str),
+                    resolved
+                        .provider_fields
+                        .get("public_url")
+                        .map(String::as_str),
                     Some("https://gen.example.com")
                 );
 
@@ -2258,7 +2240,10 @@ remote:
                     Some("legacy-token")
                 );
                 assert_eq!(
-                    resolved.provider_fields.get("binary_path").map(String::as_str),
+                    resolved
+                        .provider_fields
+                        .get("binary_path")
+                        .map(String::as_str),
                     Some("/usr/local/bin/cloudflared")
                 );
 
@@ -2286,7 +2271,10 @@ remote:
                 );
                 // A legacy-only key with no generic override is preserved.
                 assert_eq!(
-                    resolved.provider_fields.get("binary_path").map(String::as_str),
+                    resolved
+                        .provider_fields
+                        .get("binary_path")
+                        .map(String::as_str),
                     Some("/legacy/cloudflared")
                 );
 
@@ -2313,17 +2301,18 @@ remote:
                     "legacy cloudflare block must not bleed into a non-cloudflared provider"
                 );
                 assert_eq!(
-                    resolved.provider_fields.get("server_addr").map(String::as_str),
+                    resolved
+                        .provider_fields
+                        .get("server_addr")
+                        .map(String::as_str),
                     Some("relay.example.com")
                 );
             },
         );
     }
-
-    #[cfg(feature = "remote")]
     #[test]
     fn remote_config_requires_enabled_gate_and_honors_env() {
-        // Cold-daemon lazy start: a feature-build ALWAYS resolves to `Some` (the
+        // Cold-daemon lazy start: lucarned ALWAYS resolves to `Some` (the
         // control plane is served from boot); `remote.enabled` now drives
         // `autostart`, not whether the subsystem exists.
         with_env(
@@ -2341,12 +2330,12 @@ remote:
                 let default_config = LucarnedFileConfig::default();
                 let resolved = remote_config_from_config(&default_config)
                     .expect("default remote config")
-                    .expect("feature-build always resolves to Some (lazy start)");
+                    .expect("lucarned always resolves to Some (lazy start)");
                 assert!(
                     !resolved.autostart,
                     "remote disabled (default) → control plane ready, tunnel idle (autostart=false)"
                 );
-                // The control info is still resolved so `term go-public` works.
+                // The control info is still resolved so `lucarned remote start` works.
                 assert_eq!(
                     resolved.control_addr,
                     DEFAULT_REMOTE_CONTROL_ADDR.parse().unwrap()
@@ -2426,7 +2415,6 @@ remote:
 
     // SEC-002: a control_addr sharing the gateway port is rejected (it would
     // re-expose the control plane on the tunnel).
-    #[cfg(feature = "remote")]
     #[test]
     fn remote_config_rejects_control_addr_sharing_gateway_port() {
         with_env(
@@ -2456,7 +2444,6 @@ remote:
 
     // SEC-008: a weak explicit auth_token (whitespace / too short) fails closed
     // at config resolution.
-    #[cfg(feature = "remote")]
     #[test]
     fn remote_config_rejects_weak_auth_token() {
         with_env(
@@ -2502,7 +2489,6 @@ remote:
 
     // SEC-013: a read-only token is resolved when set and validated like the
     // full token (weak ⇒ rejected). Absent ⇒ no read-only tier.
-    #[cfg(feature = "remote")]
     #[test]
     fn remote_config_resolves_and_validates_readonly_token() {
         with_env(
@@ -2562,8 +2548,6 @@ remote:
             },
         );
     }
-
-    #[cfg(feature = "remote")]
     #[test]
     fn remote_config_rejects_non_loopback_gateway_addr() {
         with_env(
@@ -2704,10 +2688,9 @@ logging:
     }
 
     // H5 + cold-daemon lazy start: the remote config is resolved BEFORE the
-    // idle-exit decision and, in a feature-build, ALWAYS resolves to `Some` (the
+    // idle-exit decision and ALWAYS resolves to `Some` (the
     // control plane is served from boot — lazy start) so `remote_enabled` is true
     // and the daemon does NOT idle-exit.
-    #[cfg(feature = "remote")]
     #[test]
     fn remote_only_config_keeps_daemon_from_idle_exit() {
         // Source-level: remote_cfg is resolved before the idle-exit guidance log.
@@ -2730,7 +2713,7 @@ logging:
         );
 
         // Behavioral: even a remote-disabled config (no health, no channels)
-        // resolves to Some in a feature-build (cold-daemon lazy start: the control
+        // resolves to Some in lucarned (cold-daemon lazy start: the control
         // plane is served from boot) → remote_enabled true → no idle exit.
         with_env(
             &[
@@ -2759,7 +2742,7 @@ remote:
                     .is_some());
 
                 // Cold daemon (remote disabled): STILL resolves to Some so the
-                // control plane is up and `term go-public` can reach it — the
+                // control plane is up and `lucarned remote start` can reach it — the
                 // daemon must not idle-exit even with the tunnel idle.
                 let cold = LucarnedFileConfig::from_yaml_str(
                     r#"
@@ -2770,7 +2753,7 @@ remote:
                 .expect("parse cold remote config");
                 let resolved = remote_config_from_config(&cold)
                     .expect("cold remote config")
-                    .expect("feature-build resolves to Some even when disabled");
+                    .expect("lucarned resolves to Some even when disabled");
                 assert!(
                     !resolved.autostart,
                     "remote.enabled:false → control plane ready, tunnel idle"

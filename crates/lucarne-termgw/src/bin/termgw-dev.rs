@@ -1,9 +1,9 @@
 //! termgw-dev — standalone runner for the terminal gateway (manual/e2e test).
 //!
 //! Connects to the SYSTEM rmux daemon, adopts its sessions, and serves the ws +
-//! HTTP gateway. NOT shipped: `lucarned` embeds `lucarne_termgw::serve` behind
-//! the `rmux` feature; this binary exists only for local end-to-end testing
-//! against a real daemon.
+//! HTTP gateway. NOT shipped: `lucarned` builds the production router directly
+//! into the default product binary; this runner exists only for local
+//! end-to-end testing against a real daemon.
 //!
 //! ```text
 //! TERMGW_ADDR=127.0.0.1:7800 TERMGW_WEB=web cargo run -p lucarne-termgw --bin termgw-dev
@@ -26,7 +26,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()?;
     let web_dir = PathBuf::from(std::env::var("TERMGW_WEB").unwrap_or_else(|_| "web".to_string()));
 
-    eprintln!("termgw-dev: serving http://{addr} (web dir: {})", web_dir.display());
+    eprintln!(
+        "termgw-dev: serving http://{addr} (web dir: {})",
+        web_dir.display()
+    );
     lucarne_termgw::serve(monitor, addr, web_dir).await?;
     Ok(())
 }

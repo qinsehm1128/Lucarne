@@ -1766,25 +1766,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lucarne-agentbind"
-version = "0.4.2"
-dependencies = [
- "agent-sessions",
- "dirs",
- "rusqlite",
- "tempfile",
-]
-
-[[package]]
-name = "lucarne-archive"
-version = "0.4.2"
-dependencies = [
- "dirs",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "lucarne-channel"
 version = "0.4.2"
 dependencies = [
@@ -1810,6 +1791,9 @@ name = "lucarne-remote"
 version = "0.4.2"
 dependencies = [
  "async-trait",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -1821,9 +1805,12 @@ dependencies = [
 name = "lucarne-rmux"
 version = "0.4.2"
 dependencies = [
- "lucarne-term",
+ "bitflags 2.11.1",
+ "dirs",
  "rmux-sdk",
+ "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -1854,15 +1841,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lucarne-term"
-version = "0.4.2"
-dependencies = [
- "bitflags 2.11.1",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "lucarne-termgw"
 version = "0.4.2"
 dependencies = [
@@ -1871,32 +1849,17 @@ dependencies = [
  "dirs",
  "futures",
  "http-body-util",
- "lucarne-agentbind",
+ "lucarne",
  "lucarne-rmux",
- "lucarne-term",
  "rand 0.8.6",
  "serde",
  "serde_json",
  "subtle",
+ "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tower",
  "tower-http",
- "tracing",
-]
-
-[[package]]
-name = "lucarne-web"
-version = "0.4.2"
-dependencies = [
- "axum",
- "futures",
- "lucarne",
- "lucarne-agentbind",
- "lucarne-rmux",
- "lucarne-termgw",
- "serde",
- "serde_json",
- "tokio",
  "tracing",
 ]
 
@@ -1934,12 +1897,10 @@ dependencies = [
  "dotenvy",
  "lucarne",
  "lucarne-adapter",
- "lucarne-archive",
  "lucarne-remote",
  "lucarne-rmux",
  "lucarne-telegram",
  "lucarne-termgw",
- "lucarne-web",
  "lucarne-wechat",
  "lucarned-ctl",
  "qrcode",

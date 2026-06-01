@@ -20,9 +20,11 @@ hardened authentication story that is correct by default.
 
 ## Decision
 
-Add a pluggable **remote-access tunnel adapter** as a new rmux-free crate
-`lucarne-remote`, wired into `lucarned` behind an optional `remote` cargo
-feature. The design is captured as nine locked decisions (L1–L9).
+Add a pluggable **remote-access tunnel adapter** as a rmux-free crate
+`lucarne-remote`, wired directly into the default `lucarned` product build.
+There is no `remote` Cargo feature in the fork product line: cargo inclusion is
+unconditional, while `remote.enabled` controls daemon startup behavior. The
+design is captured as nine locked decisions (L1–L9).
 
 ### L1 — Adapter abstraction mirrors `AdapterPlugin`/`AdapterRegistry`
 
@@ -76,12 +78,13 @@ fixed runtime constants, not file-config fields.
 
 ### L6 — daemon owns the tunnel lifecycle; CLI is a thin loopback control client
 
-`lucarned` (behind the `remote` feature) owns the tunnel so it survives CLI exit
-and shuts down with the daemon, mirroring the health subsystem wiring. `termctl`
-gains a thin `go-public` subcommand that drives the daemon over a loopback-only
-control API (`POST /api/remote/start`, etc.) and renders the returned public URL +
-credentials (QR via the existing `qrcode` crate). Lifecycle ownership is
-unambiguous and the control plane stays on loopback.
+`lucarned` owns the tunnel so it survives CLI exit and shuts down with the
+daemon, mirroring the health subsystem wiring. `lucarned remote
+start|stop|status` is a thin headless loopback control client, and `lucarned
+tui` provides the interactive Go Public panel. Both drive the daemon over a
+loopback-only control API (`POST /api/remote/start`, etc.) and render the
+returned public URL + credentials (QR via the existing `qrcode` crate).
+Lifecycle ownership is unambiguous and the control plane stays on loopback.
 
 ### L7 — Reserved backends are trait seams only
 
@@ -93,10 +96,10 @@ through `RemoteRegistry` with zero changes to the core.
 
 ### L8 — Engineering discipline per AGENTS.md
 
-Nightly toolchain with `cargo -Zbuild-dir-new-layout`; the capability is a new
-feature-gated crate so default builds never pull it; this ADR records the
-decision; provider-specific logic stays in the provider module and does not
-pollute common/core layers.
+Nightly toolchain with `cargo -Zbuild-dir-new-layout`; provider-specific logic
+stays in the provider module and does not pollute common/core layers. The remote
+provider seam remains isolated, while the user-facing remote/TUI/gateway entry
+is directly fused into the default `lucarned` product build.
 
 ### L9 — Definition of done includes real-device reachability
 
@@ -122,11 +125,12 @@ resist replay and brute force.
 
 ## Consequences
 
-- `lucarned` gains an optional `remote` feature that owns the tunnel lifecycle;
-  default and `--no-default-features` builds are unaffected and never pull the
-  tunnel stack.
+- The default `lucarned` product build owns the tunnel lifecycle and always
+  includes `lucarne-remote`, `lucarne-termgw`, and `lucarne-rmux`; install users
+  do not need source-build feature flags for remote access.
 - `lucarned.yaml` gains a `remote:` section
-  (`enabled`/`provider`/`gateway_addr`/`auth_token`/`insecure`) plus a GENERIC,
+  (`enabled` as autostart, `provider`, `gateway_addr`, `control_addr`,
+  `auth_token`, `readonly_token`, `insecure`) plus a GENERIC,
   transport-agnostic `providers:` map keyed by provider id — e.g.
   `providers: { cloudflared: { token, public_url, binary_path } }` (H6c). The
   daemon passes the selected provider's field map straight through to the
@@ -147,8 +151,9 @@ resist replay and brute force.
   is not visible in the process command line (`ps` / `/proc/<pid>/cmdline`) —
   L3. It remains readable by the same local user while the tunnel runs (a
   same-user attacker is already inside the daemon's trust boundary).
-- The web client and `termgw` gain an auth layer (Bearer + ticket exchange); the
-  CLI gains a `go-public` command over the loopback control API.
+- The web client and `termgw` gain an auth layer (Bearer + ticket exchange);
+  `lucarned remote` and the `lucarned tui` Go Public panel drive the loopback
+  control API.
 - Adding FRP / relay / other tunnels later is a localized change: one
   `RemoteAccessProvider` impl + one registry registration + a `providers.<id>`
   config block — no daemon-config or common-layer change.

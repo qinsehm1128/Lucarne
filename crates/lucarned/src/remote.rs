@@ -1,5 +1,4 @@
-//! Remote-access subsystem wiring for `lucarned` (compiled only under the
-//! `remote` cargo feature).
+//! Remote-access subsystem wiring for `lucarned`.
 //!
 //! Owns the public-tunnel lifecycle inside the daemon (Locked decision L6): the
 //! daemon binds the terminal gateway to **loopback** (Locked decision L3),
@@ -18,19 +17,25 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use lucarne::control_plane::ControlPlaneSqliteStore;
 use lucarne_remote::{ProviderConfig, RemoteRegistry, TunnelHandle, TunnelStatus};
+use lucarne_rmux::RmuxMonitor;
 use lucarne_termgw::{
     AccessToken, AuthState, ForwardedIdentityPolicy, GatewayLimits, RemoteControl,
     RemoteControlError, RemoteControlStatus, RemoteStartParams, WsConnectionPool,
 };
-use lucarne_web::WebChat;
-use lucarne_rmux::RmuxMonitor;
 use tokio::sync::{watch, Mutex};
 use tracing::{info, warn};
 
-/// Web asset directory served by the gateway (static dual-mode web app). Env
+#[cfg(test)]
+#[async_trait]
+trait GatewayStarter: Send + Sync {
+    async fn start_gateway(&self) -> Result<(), RemoteControlError>;
+}
+
+/// Web asset directory served by the gateway for local/static clients. Env
 /// `LUCARNED_REMOTE_WEB` overrides; defaults to `web` (relative to the daemon's
-/// working dir), matching the dev runners (`termgw-dev`, `webdev`).
+/// working dir), matching the `termgw-dev` runner.
 const DEFAULT_WEB_DIR: &str = "web";
 
 /// How often the H3 health watcher polls the running tunnel and reaps it if the
@@ -74,7 +79,7 @@ pub struct RemoteRuntimeConfig {
     /// the configured tunnel at boot (the historical `remote.enabled:true`
     /// behaviour — gateway + monitor + tunnel come up immediately). When `false`
     /// the control plane is still served from boot but the gateway / rmux monitor
-    /// / tunnel stay idle until the first `term go-public` (`/api/remote/start`).
+    /// / tunnel stay idle until the first `lucarned remote start` (`/api/remote/start`).
     pub autostart: bool,
 }
 
@@ -84,7 +89,7 @@ impl RemoteRuntimeConfig {
     /// types leak in). H6c: this is now a pure copy of the generic
     /// `provider_fields` map — the daemon maps NO provider-specific field names.
     ///
-    /// G3: `overrides` are CLI-supplied field values (from `term go-public`)
+    /// G3: `overrides` are CLI-supplied field values (from `lucarned remote start`)
     /// merged **over** the daemon's configured fields — a present override wins,
     /// an absent one keeps the configured value. An empty `overrides` map yields
     /// exactly the daemon's pre-configured fields (backward compatible).
@@ -117,7 +122,7 @@ impl RemoteRuntimeConfig {
 ///
 /// `public_url` is `Some` only when the tunnel was actually started (autostart),
 /// and `None` when the control plane is up but the tunnel is still idle (cold
-/// daemon waiting for `term go-public`).
+/// daemon waiting for `lucarned remote start`).
 pub struct RemoteSubsystem {
     pub provider: String,
     pub public_url: Option<String>,
@@ -150,12 +155,15 @@ struct DaemonRemoteControl {
     /// gateway. `ensure_gateway` runs that wiring at most once (`gateway_up`).
     auth: AuthState,
     ws_pool: WsConnectionPool,
+    control_store: ControlPlaneSqliteStore,
     web_dir: PathBuf,
     /// Once-guard for the lazy gateway bring-up. `false` until `ensure_gateway`
     /// has connected rmux + bound + spawned the gateway serve task; then `true`.
     /// H4 discipline: the heavy work (rmux connect / bind / serve) runs with this
     /// lock RELEASED; the lock is only held to read/set the flag.
     gateway_up: Mutex<bool>,
+    #[cfg(test)]
+    gateway_starter: Option<Arc<dyn GatewayStarter>>,
 }
 
 /// Tunnel lifecycle (H4). `Starting` / `Stopping` are transient markers so a
@@ -408,10 +416,9 @@ impl DaemonRemoteControl {
     ///
     /// On a cold daemon (`autostart:false`) the control plane is served from boot
     /// but the rmux monitor + termgw gateway are NOT — the first `start()` (from
-    /// `term go-public`, or autostart) runs this. It connects the system rmux
-    /// monitor, builds the termgw router on the shared ws pool (merging the
-    /// ticket-gated `lucarne-web` `/chat` when available), binds the loopback
-    /// gateway, and spawns its serve task.
+    /// `lucarned remote start`, or autostart) runs this. It connects the system rmux
+    /// monitor, builds the termgw router on the shared ws pool, binds the
+    /// loopback gateway, and spawns its serve task.
     ///
     /// H4 discipline: the `gateway_up` lock is NEVER held across the heavy awaits
     /// (rmux connect / bind / serve). Phase 1 reads the flag under the lock and
@@ -423,10 +430,20 @@ impl DaemonRemoteControl {
     ///
     /// An rmux connect / bind failure returns [`RemoteControlError::Backend`] so
     /// the CLI gets a clear error WITHOUT crashing the daemon (the control plane
-    /// stays up; a later `term go-public` can retry once rmux is available).
+    /// stays up; a later `lucarned remote start` can retry once rmux is available).
     async fn ensure_gateway(&self) -> Result<(), RemoteControlError> {
         // Phase 1 (locked): already up → nothing to do.
         if *self.gateway_up.lock().await {
+            return Ok(());
+        }
+
+        #[cfg(test)]
+        if let Some(starter) = &self.gateway_starter {
+            starter.start_gateway().await?;
+            let mut guard = self.gateway_up.lock().await;
+            if !*guard {
+                *guard = true;
+            }
             return Ok(());
         }
 
@@ -446,37 +463,17 @@ impl DaemonRemoteControl {
             "lucarned remote: adopted system rmux sessions"
         );
 
-        // SEC-001 / H1 / C1: the merged `/chat` ws does NOT inherit the gateway
-        // router's auth/limits across `merge`, so we build it with `router_gated`
-        // — the SAME single-use ticket auth, the SAME shared ws pool (one global
-        // cap), idle/lifetime close, inbound frame rate, AND read-only scope as
-        // termgw's ws routes. Best-effort: a chat init failure serves terminal-only.
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| ".".to_string());
-        let chat_router = match WebChat::new(cwd, None).await {
-            Ok(chat) => Some(lucarne_web::router_gated(
-                chat,
-                self.auth.clone(),
-                self.ws_pool.clone(),
-            )),
-            Err(e) => {
-                warn!(error = %e, "lucarned remote: web chat bridge unavailable; serving terminal-only");
-                None
-            }
-        };
-
-        // H1: build the gateway router on the SAME shared ws pool the chat router
-        // uses, so `/ws` + `/agent` + `/chat` share one global connection cap.
-        let mut app = lucarne_termgw::router_with_pool(
+        // H1: build the gateway router on the shared ws pool so `/ws` and
+        // `/agent` share one global connection cap. Web apps are external
+        // consumers of this gateway API; the daemon no longer owns a separate
+        // web-chat runtime crate.
+        let app = lucarne_termgw::router_with_pool_and_store(
             monitor,
             self.web_dir.clone(),
             self.auth.clone(),
             self.ws_pool.clone(),
+            self.control_store.clone(),
         );
-        if let Some(chat) = chat_router {
-            app = app.merge(chat);
-        }
         let listener = tokio::net::TcpListener::bind(self.config.gateway_addr)
             .await
             .map_err(|e| {
@@ -608,15 +605,15 @@ fn build_auth(
 }
 
 /// Start the remote-access subsystem: build the default-deny auth state, serve
-/// the loopback-only control plane (so `term go-public` can reach the daemon from
+/// the loopback-only control plane (so `lucarned remote start` can reach the daemon from
 /// boot), and — only when `config.autostart` — bring up the gateway + tunnel.
 ///
 /// Cold-daemon lazy start (this change): the control plane (SEC-002, port 7801)
 /// is ALWAYS served, even when the tunnel is idle, so `/api/remote/status`
-/// returns the access token + `running:false` from startup and `term go-public`
+/// returns the access token + `running:false` from startup and `lucarned remote start`
 /// is never refused with a connection-refused. The rmux monitor + termgw gateway
 /// + tunnel are brought up lazily on the first `start()` (via
-/// [`DaemonRemoteControl::ensure_gateway`]) — either from `term go-public` or, when
+/// [`DaemonRemoteControl::ensure_gateway`]) — either from `lucarned remote start` or, when
 /// `autostart` is set (`remote.enabled:true`), from a single `control.start()`
 /// here at boot (preserving the historical behaviour). An rmux-less environment
 /// therefore no longer crashes the daemon: the control plane stays up and a
@@ -626,6 +623,7 @@ fn build_auth(
 /// run in spawned tasks; the tunnel is stopped when `shutdown` fires.
 pub async fn spawn_remote_subsystem(
     config: RemoteRuntimeConfig,
+    control_store: ControlPlaneSqliteStore,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<RemoteSubsystem, Box<dyn std::error::Error>> {
     // default-deny (L4): require a token. Generate one when absent unless the
@@ -636,7 +634,10 @@ pub async fn spawn_remote_subsystem(
             let token = AccessToken::from_secret_validated(token.clone())
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
             let secret = token.as_str().to_string();
-            (build_auth(token, config.readonly_token.as_deref())?, Some(secret))
+            (
+                build_auth(token, config.readonly_token.as_deref())?,
+                Some(secret),
+            )
         }
         (None, false) => {
             let token = AccessToken::generate();
@@ -645,7 +646,10 @@ pub async fn spawn_remote_subsystem(
                 "lucarned remote: no auth_token configured — generated an ephemeral \
                  access token for this session (set remote.auth_token to persist it)"
             );
-            (build_auth(token, config.readonly_token.as_deref())?, Some(secret))
+            (
+                build_auth(token, config.readonly_token.as_deref())?,
+                Some(secret),
+            )
         }
         (None, true) => {
             warn!(
@@ -669,10 +673,9 @@ pub async fn spawn_remote_subsystem(
     let auth = auth.with_forwarded_identity(forwarded_policy);
 
     // H1: ONE shared ws-connection pool drives every ws route on the gateway port
-    // — the termgw `/ws` + `/agent` AND the merged `lucarne-web` `/chat` — so a
-    // single `max_ws_connections` cap (plus the same idle/lifetime/inbound-frame-
-    // rate limits) governs all of them. Built here so it is shared by the lazy
-    // gateway bring-up (`ensure_gateway`).
+    // (`/ws` + `/agent`) so a single `max_ws_connections` cap (plus the same
+    // idle/lifetime/inbound-frame-rate limits) governs all of them. Built here
+    // so it is shared by the lazy gateway bring-up (`ensure_gateway`).
     let ws_pool = WsConnectionPool::new(GatewayLimits::default());
 
     // Web asset dir served by the gateway (resolved here so `ensure_gateway` does
@@ -694,14 +697,17 @@ pub async fn spawn_remote_subsystem(
         state: Mutex::new(TunnelState::Idle),
         auth,
         ws_pool,
+        control_store,
         web_dir,
         gateway_up: Mutex::new(false),
+        #[cfg(test)]
+        gateway_starter: None,
     });
 
     // SEC-002: serve the loopback-only control plane on its OWN distinct port the
     // tunnel never targets. This separation — not peer-IP — is the trust boundary
     // that keeps `/api/remote/*` (and the `access_token`) off the tunnel. Always
-    // served (even on a cold daemon) so `term go-public` can reach the daemon.
+    // served (even on a cold daemon) so `lucarned remote start` can reach the daemon.
     let control_for_plane = control.clone() as Arc<dyn RemoteControl>;
     let control_listener = tokio::net::TcpListener::bind(control_addr).await?;
     let control_bound = control_listener.local_addr()?;
@@ -723,9 +729,9 @@ pub async fn spawn_remote_subsystem(
 
     // Autostart (historical `remote.enabled:true` behaviour): bring up the
     // gateway + tunnel immediately via one `start()` (the SAME lazy path
-    // `term go-public` uses — `ensure_gateway` then `provider.start`). When
+    // `lucarned remote start` uses — `ensure_gateway` then `provider.start`). When
     // `autostart` is false the control plane is ready and the tunnel stays idle
-    // until the first `term go-public`. The daemon's auto-start uses its
+    // until the first `lucarned remote start`. The daemon's auto-start uses its
     // pre-configured provider + fields (empty params — the G3 override path is the
     // CLI's `/api/remote/start` body).
     let public_url = if config.autostart {
@@ -741,7 +747,7 @@ pub async fn spawn_remote_subsystem(
         )
     } else {
         info!(
-            "lucarned remote: control plane ready, tunnel idle — run `term go-public` to open public access"
+            "lucarned remote: control plane ready, tunnel idle — run `lucarned remote start` to open public access"
         );
         None
     };
@@ -806,7 +812,9 @@ pub async fn spawn_remote_subsystem(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use lucarne_remote::{RemoteAccessProvider, RemoteError, RemoteResult, RequiredField};
     // `TunnelHandle::public_url` is a `url::Url`; lucarned does not depend on the
     // `url` crate directly, but reqwest re-exports the very same type, so build
     // test URLs through `reqwest::Url` (== `url::Url`).
@@ -842,16 +850,166 @@ mod tests {
     /// it sits in `Idle` with no gateway up, so `status`/`stop`/`status_from` can
     /// be exercised without ever connecting rmux or binding a port.
     fn control(config: RemoteRuntimeConfig, access_token: Option<String>) -> DaemonRemoteControl {
+        control_with_registry(config, access_token, lucarne_remote::builtin(), None)
+    }
+
+    fn control_with_registry(
+        config: RemoteRuntimeConfig,
+        access_token: Option<String>,
+        registry: lucarne_remote::RemoteRegistry,
+        gateway_starter: Option<Arc<dyn GatewayStarter>>,
+    ) -> DaemonRemoteControl {
         DaemonRemoteControl {
-            registry: lucarne_remote::builtin(),
+            registry,
             config,
             access_token,
             state: Mutex::new(TunnelState::Idle),
             auth: AuthState::disabled(),
             ws_pool: WsConnectionPool::new(GatewayLimits::default()),
+            control_store: ControlPlaneSqliteStore::open_in_memory()
+                .expect("open in-memory control-plane store"),
             web_dir: PathBuf::from("web"),
             gateway_up: Mutex::new(false),
+            gateway_starter,
         }
+    }
+
+    #[derive(Default)]
+    struct CountingGatewayStarter {
+        calls: AtomicUsize,
+        failures: AtomicUsize,
+    }
+
+    impl CountingGatewayStarter {
+        fn fail_next(&self) {
+            self.failures.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl GatewayStarter for CountingGatewayStarter {
+        async fn start_gateway(&self) -> Result<(), RemoteControlError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.failures.load(Ordering::SeqCst) > 0 {
+                self.failures.fetch_sub(1, Ordering::SeqCst);
+                return Err(RemoteControlError::Backend("gateway failed".to_string()));
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeProvider {
+        state: Arc<FakeProviderState>,
+    }
+
+    #[derive(Default)]
+    struct FakeProviderState {
+        starts: AtomicUsize,
+        stops: AtomicUsize,
+        health: AtomicUsize,
+        fail_starts: AtomicUsize,
+        fail_stops: AtomicUsize,
+        health_down: AtomicUsize,
+    }
+
+    impl FakeProvider {
+        fn fail_next_start(&self) {
+            self.state.fail_starts.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn fail_next_stop(&self) {
+            self.state.fail_stops.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn report_down_once(&self) {
+            self.state.health_down.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn starts(&self) -> usize {
+            self.state.starts.load(Ordering::SeqCst)
+        }
+
+        fn stops(&self) -> usize {
+            self.state.stops.load(Ordering::SeqCst)
+        }
+
+        fn health_checks(&self) -> usize {
+            self.state.health.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl RemoteAccessProvider for FakeProvider {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        fn name(&self) -> &'static str {
+            "Fake"
+        }
+
+        fn required_fields(&self) -> &[RequiredField] {
+            &[]
+        }
+
+        async fn start(
+            &self,
+            _local: std::net::SocketAddr,
+            _cfg: &ProviderConfig,
+        ) -> RemoteResult<TunnelHandle> {
+            self.state.starts.fetch_add(1, Ordering::SeqCst);
+            if self.state.fail_starts.load(Ordering::SeqCst) > 0 {
+                self.state.fail_starts.fetch_sub(1, Ordering::SeqCst);
+                return Err(RemoteError::Spawn {
+                    provider: "fake".to_string(),
+                    message: "start failed".to_string(),
+                });
+            }
+            Ok(TunnelHandle {
+                provider_id: "fake".to_string(),
+                public_url: Url::parse("https://fake.example.test/").unwrap(),
+                opaque: format!("fake-{}", self.state.starts.load(Ordering::SeqCst)),
+            })
+        }
+
+        async fn stop(&self, _handle: TunnelHandle) -> RemoteResult<()> {
+            self.state.stops.fetch_add(1, Ordering::SeqCst);
+            if self.state.fail_stops.load(Ordering::SeqCst) > 0 {
+                self.state.fail_stops.fetch_sub(1, Ordering::SeqCst);
+                return Err(RemoteError::Io(std::io::Error::other("stop failed")));
+            }
+            Ok(())
+        }
+
+        async fn health(&self, _handle: &TunnelHandle) -> RemoteResult<TunnelStatus> {
+            self.state.health.fetch_add(1, Ordering::SeqCst);
+            if self.state.health_down.load(Ordering::SeqCst) > 0 {
+                self.state.health_down.fetch_sub(1, Ordering::SeqCst);
+                return Ok(TunnelStatus::Down);
+            }
+            Ok(TunnelStatus::Up)
+        }
+    }
+
+    fn fake_control(
+        provider: FakeProvider,
+        gateway: Arc<CountingGatewayStarter>,
+    ) -> DaemonRemoteControl {
+        let mut config = base_config();
+        config.provider = "fake".to_string();
+        let mut registry = lucarne_remote::RemoteRegistry::new();
+        registry.register(provider);
+        control_with_registry(
+            config,
+            Some(VALID_TOKEN.to_string()),
+            registry,
+            Some(gateway),
+        )
     }
 
     // ---- G3: RemoteRuntimeConfig::provider_config override / merge ----
@@ -859,7 +1017,8 @@ mod tests {
     #[test]
     fn provider_config_uses_daemon_fields_when_no_overrides() {
         let mut config = base_config();
-        config.provider_fields = fields(&[("token", "cfg-token"), ("public_url", "https://a.test")]);
+        config.provider_fields =
+            fields(&[("token", "cfg-token"), ("public_url", "https://a.test")]);
         let cfg = config.provider_config(&BTreeMap::new());
         assert_eq!(cfg.get("token"), Some("cfg-token"));
         assert_eq!(cfg.get("public_url"), Some("https://a.test"));
@@ -868,7 +1027,8 @@ mod tests {
     #[test]
     fn provider_config_cli_overrides_win_over_daemon_fields() {
         let mut config = base_config();
-        config.provider_fields = fields(&[("token", "cfg-token"), ("public_url", "https://a.test")]);
+        config.provider_fields =
+            fields(&[("token", "cfg-token"), ("public_url", "https://a.test")]);
         // G3: a present override wins; an absent one keeps the configured value.
         let overrides = fields(&[("token", "cli-token")]);
         let cfg = config.provider_config(&overrides);
@@ -972,7 +1132,9 @@ mod tests {
         assert!(matches!(spawn, RemoteControlError::Backend(_)));
         assert_eq!(spawn.status_code(), axum::http::StatusCode::BAD_GATEWAY);
 
-        let io = map_remote_error(lucarne_remote::RemoteError::Io(std::io::Error::other("boom")));
+        let io = map_remote_error(lucarne_remote::RemoteError::Io(std::io::Error::other(
+            "boom",
+        )));
         assert!(matches!(io, RemoteControlError::Backend(_)));
     }
 
@@ -1004,7 +1166,7 @@ mod tests {
         assert!(!status.running);
         assert_eq!(status.provider, None);
         assert_eq!(status.public_url, None);
-        // Token still surfaced when idle so `term go-public` can render the QR.
+        // Token still surfaced when idle so `lucarned remote start` can render the QR.
         assert_eq!(status.access_token.as_deref(), Some(VALID_TOKEN));
     }
 
@@ -1056,5 +1218,174 @@ mod tests {
             .expect_err("a start already in progress must be rejected");
         assert!(matches!(err, RemoteControlError::Backend(_)));
     }
-}
 
+    #[tokio::test]
+    async fn start_success_sets_running_and_reuses_gateway_on_idempotent_start() {
+        let provider = FakeProvider::default();
+        let gateway = Arc::new(CountingGatewayStarter::default());
+        let ctl = fake_control(provider.clone(), gateway.clone());
+
+        let status = ctl
+            .start(RemoteStartParams::default())
+            .await
+            .expect("start succeeds");
+        assert!(status.running);
+        assert_eq!(status.provider.as_deref(), Some("fake"));
+        assert_eq!(
+            status.public_url.as_deref(),
+            Some("https://fake.example.test/")
+        );
+        assert_eq!(provider.starts(), 1);
+        assert_eq!(gateway.calls(), 1);
+
+        let status = ctl
+            .start(RemoteStartParams::default())
+            .await
+            .expect("idempotent running start succeeds");
+        assert!(status.running);
+        assert_eq!(
+            provider.starts(),
+            1,
+            "healthy running tunnel must not start a second provider"
+        );
+        assert_eq!(
+            gateway.calls(),
+            1,
+            "lazy gateway is guarded and must start once"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_provider_failure_returns_to_idle_for_retry() {
+        let provider = FakeProvider::default();
+        provider.fail_next_start();
+        let gateway = Arc::new(CountingGatewayStarter::default());
+        let ctl = fake_control(provider.clone(), gateway.clone());
+
+        let err = ctl
+            .start(RemoteStartParams::default())
+            .await
+            .expect_err("first provider start fails");
+        assert!(matches!(err, RemoteControlError::Backend(_)));
+        assert!(
+            !ctl.status().await.running,
+            "failed start must return to Idle"
+        );
+
+        let status = ctl
+            .start(RemoteStartParams::default())
+            .await
+            .expect("retry after failed start succeeds");
+        assert!(status.running);
+        assert_eq!(provider.starts(), 2, "retry must call provider.start again");
+        assert_eq!(
+            gateway.calls(),
+            1,
+            "gateway already came up before provider failure and is reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_gateway_failure_returns_to_idle_and_allows_retry() {
+        let provider = FakeProvider::default();
+        let gateway = Arc::new(CountingGatewayStarter::default());
+        gateway.fail_next();
+        let ctl = fake_control(provider.clone(), gateway.clone());
+
+        let err = ctl
+            .start(RemoteStartParams::default())
+            .await
+            .expect_err("first lazy gateway start fails");
+        assert!(matches!(err, RemoteControlError::Backend(_)));
+        assert!(
+            !ctl.status().await.running,
+            "gateway failure must return to Idle"
+        );
+        assert_eq!(
+            provider.starts(),
+            0,
+            "provider must not start until gateway is available"
+        );
+
+        let status = ctl
+            .start(RemoteStartParams::default())
+            .await
+            .expect("retry starts gateway and provider");
+        assert!(status.running);
+        assert_eq!(gateway.calls(), 2);
+        assert_eq!(provider.starts(), 1);
+    }
+
+    #[tokio::test]
+    async fn stop_running_tunnel_transitions_to_idle() {
+        let provider = FakeProvider::default();
+        let gateway = Arc::new(CountingGatewayStarter::default());
+        let ctl = fake_control(provider.clone(), gateway);
+
+        ctl.start(RemoteStartParams::default())
+            .await
+            .expect("start succeeds");
+        let stopped = ctl.stop().await.expect("stop succeeds");
+        assert!(!stopped.running);
+        assert_eq!(provider.stops(), 1);
+        assert!(!ctl.status().await.running);
+    }
+
+    #[tokio::test]
+    async fn status_reaps_down_tunnel_and_next_start_relaunches() {
+        let provider = FakeProvider::default();
+        let gateway = Arc::new(CountingGatewayStarter::default());
+        let ctl = fake_control(provider.clone(), gateway);
+
+        ctl.start(RemoteStartParams::default())
+            .await
+            .expect("start succeeds");
+        assert_eq!(provider.starts(), 1);
+
+        provider.report_down_once();
+        let status = ctl.status().await;
+        assert!(!status.running, "health=Down must clear the running handle");
+        assert_eq!(
+            provider.health_checks(),
+            1,
+            "status probes provider health once"
+        );
+
+        let relaunched = ctl
+            .start(RemoteStartParams::default())
+            .await
+            .expect("start after reap succeeds");
+        assert!(relaunched.running);
+        assert_eq!(
+            provider.starts(),
+            2,
+            "reaped tunnel must be relaunched on the next start"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_recoverable_failure_retains_handle_for_retry() {
+        let provider = FakeProvider::default();
+        let gateway = Arc::new(CountingGatewayStarter::default());
+        let ctl = fake_control(provider.clone(), gateway);
+
+        ctl.start(RemoteStartParams::default())
+            .await
+            .expect("start succeeds");
+        provider.fail_next_stop();
+
+        let err = ctl
+            .stop()
+            .await
+            .expect_err("recoverable stop failure is surfaced");
+        assert!(matches!(err, RemoteControlError::Backend(_)));
+        assert!(
+            ctl.status().await.running,
+            "recoverable stop failure must retain the running handle"
+        );
+
+        let stopped = ctl.stop().await.expect("retry stop succeeds");
+        assert!(!stopped.running);
+        assert_eq!(provider.stops(), 2, "retry must call provider.stop again");
+    }
+}

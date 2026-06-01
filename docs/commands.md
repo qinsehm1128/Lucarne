@@ -57,15 +57,13 @@
 | `/config global notifications on\|off` | 开关全局通知 |
 | `/config global bypass on\|off` | 开关全局权限绕过 |
 
-## 终端控制台（`lucarned tui`，可选）
+## 终端控制台（`lucarned tui`）
 
-`lucarned tui` 是本地操作者的唯一交互入口（替代旧的 `term` CLI），需在 `tui`
-feature（隐含 `remote`）下构建：
+`lucarned tui` 是本地操作者的唯一交互入口（替代旧的 `term` CLI）：
 
 > 完整说明（面板、键位、Go Public 的守护进程依赖、`term` → `lucarned tui` 迁移）见 [`docs/tui.md`](tui.md)。
 
 ```bash
-cargo +nightly build --features tui
 lucarned tui
 ```
 
@@ -98,6 +96,28 @@ lucarned tui
 | `r` | 查询状态（`/api/remote/status`） |
 | `Enter` | 弹出登录 URL 的高对比二维码模态（终端过小时回退为纯 URL） |
 | `Esc` / `q` / `Enter` | 关闭二维码模态 |
+
+## Headless 远程接入（`lucarned remote`）
+
+`lucarned remote` 是 TUI Go Public 面板的脚本化对等入口。它只调用 daemon 的
+loopback control plane，不直接拥有隧道生命周期；daemon 必须正在运行。
+
+```bash
+lucarned remote start
+lucarned remote start --provider cloudflared --field token=... --field public_url=https://...
+lucarned remote status --json
+lucarned remote stop
+```
+
+| 命令 | 用途 |
+|---|---|
+| `lucarned remote start` | 通过 `/api/remote/start` 启动远程接入隧道 |
+| `lucarned remote status` | 通过 `/api/remote/status` 查询隧道状态 |
+| `lucarned remote stop` | 通过 `/api/remote/stop` 停止隧道 |
+| `--control-port PORT` | 指定 loopback control plane 端口，默认 `7801` |
+| `--json` | 输出稳定 JSON，便于脚本消费 |
+| `--provider ID` | 仅 `start`：覆盖 daemon 配置中的 provider |
+| `--field KEY=VALUE` | 仅 `start`：覆盖/补充 provider 字段 |
 
 ### Config 面板（远程配置）
 

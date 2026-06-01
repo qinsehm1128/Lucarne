@@ -1,16 +1,10 @@
 //! registry — the in-process terminal-session registry.
-//!
-//! Tracks every monitored rmux session as a [`SessionDescriptor`] tagged with its
-//! [`Origin`]: `Adopted` = discovered on the system rmux daemon (the common case
-//! — we MONITOR the user's daemon, we don't own it); `Managed` = created by this
-//! process via the CLI / `new`. Both are mirror + input capable; the origin only
-//! records provenance (e.g. whether a `kill` is "ours" to do safely).
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::grid::Dims;
+use crate::term::grid::Dims;
 
 /// Stable session handle, e.g. "{session}:{window}:{pane}".
 pub type SessionId = String;
@@ -34,8 +28,7 @@ pub struct SessionDescriptor {
     pub origin: Origin,
     /// PTY grid size last seen at registration.
     pub dims: Dims,
-    /// The pane's current working directory, if known (drives the file tree and
-    /// agent-session binding). `None` when rmux could not report it.
+    /// The pane's current working directory, if known.
     #[serde(default)]
     pub cwd: Option<String>,
 }
@@ -127,7 +120,10 @@ mod tests {
     use super::*;
 
     fn dims() -> Dims {
-        Dims { cols: 120, rows: 32 }
+        Dims {
+            cols: 120,
+            rows: 32,
+        }
     }
 
     #[test]
@@ -153,7 +149,6 @@ mod tests {
     fn register_replaces_existing_and_remove_works() {
         let mut reg = SessionRegistry::new();
         reg.register("s:0:0".to_string(), "old", Origin::Adopted, dims());
-        // Re-register same id with a new origin -> replaces by id.
         let d = reg.register("s:0:0".to_string(), "new", Origin::Managed, dims());
         assert_eq!(reg.len(), 1);
         assert_eq!(d.origin, Origin::Managed);

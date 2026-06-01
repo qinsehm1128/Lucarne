@@ -1,4 +1,4 @@
-// Style bit values aligned to the Rust `lucarne_term::Style` (u16 bitflags,
+// Style bit values aligned to the Rust `lucarne_rmux::term::Style` (u16 bitflags,
 // serialized as raw bits). Mirror of the server-side names.
 export const StyleBits = {
   BOLD: 0x0001,
