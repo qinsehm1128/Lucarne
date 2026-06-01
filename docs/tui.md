@@ -74,11 +74,26 @@ Drives the daemon's loopback control plane (`/api/remote/{start,stop,status}` on
 
 | Key | Action |
 |-----|--------|
-| `s` | **Start** remote access (go public) |
+| `s` | **Start** remote access (go public) — uses the **Config panel's live fields** |
 | `x` | Stop remote access |
 | `r` | Refresh status |
 | `Enter` | Show the login **QR** (when a tunnel is up) — scannable, high-contrast; falls back to the plain login URL if the terminal is too small |
 | `Esc` | Close the QR modal |
+
+> **`s` uses your in-TUI Config — no `lucarned.yaml` edit needed.** Pressing `s`
+> starts the tunnel with the **provider + fields currently set in the Config
+> panel** (its live edit buffer), not whatever is saved on disk. The workflow is:
+> configure the provider/fields in **Config**, switch to **Go Public**, press `s`.
+> The daemon merges those over its pre-configured tunnel, so you can "configure +
+> go public" entirely inside the TUI without saving first. The Go Public body shows
+> the source on a `start uses Config: provider=<id> (<n> fields)` line.
+>
+> If a provider IS set, its config is validated against the provider descriptor
+> before sending; an invalid config (e.g. a missing required field) is surfaced
+> inline (`start blocked — …`) and nothing is sent. If the **Config panel is empty**
+> (no provider selected) the body shows `start uses daemon default (no provider set
+> in Config)` and `s` falls back to the daemon's **pre-configured** tunnel
+> (`lucarned.yaml`'s `remote:` section).
 
 > **Requires the `lucarned` daemon to be running.** The daemon owns the tunnel
 > lifecycle (it serves the loopback control plane); the TUI is a thin front-end and

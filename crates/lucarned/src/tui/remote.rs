@@ -105,6 +105,27 @@ pub fn login_url(public_url: &str, access_token: Option<&str>) -> String {
 // control-plane primitives (`call_remote_start`/`status`/`stop`) and the QR/URL
 // helpers (`render_terminal_qr`/`login_url`) below are the live surface.
 
+/// Shared `reqwest::blocking` control-plane round-trip (MNT-003): run the prepared
+/// `request`, map a transport error to a "failed to reach daemon at {url}" message,
+/// reject a non-2xx with `daemon returned {code}: {detail}`, then parse the body as
+/// the `RemoteStartStatus` JSON contract. Every `/api/remote/*` call goes through
+/// this one place so the send → status-check → parse boilerplate lives once.
+fn send_control(
+    request: reqwest::blocking::RequestBuilder,
+    url: &str,
+) -> Result<lucarne_remote_status::RemoteStartStatus, String> {
+    let resp = request
+        .send()
+        .map_err(|e| format!("failed to reach daemon at {url}: {e}"))?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let detail = resp.text().unwrap_or_default();
+        return Err(format!("daemon returned {code}: {detail}"));
+    }
+    resp.json::<lucarne_remote_status::RemoteStartStatus>()
+        .map_err(|e| format!("failed to parse daemon response: {e}"))
+}
+
 /// POST `/api/remote/start` to the daemon loopback control plane and parse the
 /// `RemoteControlStatus` response. The TUI sends the chosen provider id + that
 /// provider's fields as the JSON body ([`RemoteStartParams`]); the daemon uses
@@ -118,18 +139,7 @@ pub fn call_remote_start(
         "fields": plan.fields,
     });
     let client = reqwest::blocking::Client::new();
-    let resp = client
-        .post(&plan.control_url)
-        .json(&body)
-        .send()
-        .map_err(|e| format!("failed to reach daemon at {}: {e}", plan.control_url))?;
-    if !resp.status().is_success() {
-        let code = resp.status();
-        let detail = resp.text().unwrap_or_default();
-        return Err(format!("daemon returned {code}: {detail}"));
-    }
-    resp.json::<lucarne_remote_status::RemoteStartStatus>()
-        .map_err(|e| format!("failed to parse daemon response: {e}"))
+    send_control(client.post(&plan.control_url).json(&body), &plan.control_url)
 }
 
 /// The loopback control URL for one `/api/remote/<verb>` route on `control_port`.
@@ -146,17 +156,7 @@ pub fn call_remote_status(
 ) -> Result<lucarne_remote_status::RemoteStartStatus, String> {
     let url = control_url(control_port, "status");
     let client = reqwest::blocking::Client::new();
-    let resp = client
-        .get(&url)
-        .send()
-        .map_err(|e| format!("failed to reach daemon at {url}: {e}"))?;
-    if !resp.status().is_success() {
-        let code = resp.status();
-        let detail = resp.text().unwrap_or_default();
-        return Err(format!("daemon returned {code}: {detail}"));
-    }
-    resp.json::<lucarne_remote_status::RemoteStartStatus>()
-        .map_err(|e| format!("failed to parse daemon response: {e}"))
+    send_control(client.get(&url), &url)
 }
 
 /// POST `/api/remote/stop` on the loopback control plane (idempotent: stopping an
@@ -166,17 +166,7 @@ pub fn call_remote_stop(
 ) -> Result<lucarne_remote_status::RemoteStartStatus, String> {
     let url = control_url(control_port, "stop");
     let client = reqwest::blocking::Client::new();
-    let resp = client
-        .post(&url)
-        .send()
-        .map_err(|e| format!("failed to reach daemon at {url}: {e}"))?;
-    if !resp.status().is_success() {
-        let code = resp.status();
-        let detail = resp.text().unwrap_or_default();
-        return Err(format!("daemon returned {code}: {detail}"));
-    }
-    resp.json::<lucarne_remote_status::RemoteStartStatus>()
-        .map_err(|e| format!("failed to parse daemon response: {e}"))
+    send_control(client.post(&url), &url)
 }
 
 /// Mirror of `lucarne_termgw::RemoteControlStatus` for deserialization (the TUI
@@ -252,14 +242,28 @@ pub fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, w, h)
 }
 
-/// What the Go-Public panel needs the event loop to do after a key press. Inline
-/// actions (status/start/stop) run synchronously inside the panel; this enum is
-/// the seam for any future deferred work and keeps the per-panel key handler
-/// uniform with the Sessions panel.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GoPublicAction {
-    /// Nothing for the loop to do.
-    None,
+/// Validate a CLI-supplied provider id + field map against the provider's own
+/// descriptor BEFORE sending `/api/remote/start` (PART 1 step 5). The check lives
+/// behind `lucarne_remote::builtin()` so the provider boundary (AGENTS.md) stays
+/// intact — the panel never enumerates concrete provider fields, it just builds an
+/// opaque [`ProviderConfig`] from the (already non-empty) field values and asks the
+/// provider to enforce its own rules. Returns `Err(detail)` on an unknown provider
+/// or a failed `validate_config`; `Ok(())` when the config is acceptable.
+fn validate_start_config(
+    provider: &str,
+    fields: &std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    let registry = lucarne_remote::builtin();
+    let descriptor = registry
+        .get(provider)
+        .ok_or_else(|| format!("unknown provider `{provider}`"))?;
+    let mut cfg = lucarne_remote::ProviderConfig::new();
+    for (k, v) in fields {
+        if !v.is_empty() {
+            cfg.fields.insert(k.clone(), v.clone());
+        }
+    }
+    descriptor.validate_config(&cfg)
 }
 
 /// Turn a control-plane call error into an actionable panel message. The
@@ -339,17 +343,52 @@ impl GoPublicPanel {
         }
     }
 
-    /// Start remote access via the loopback control plane (`POST /api/remote/start`
-    /// with empty params → the daemon brings up its pre-configured tunnel — v1
-    /// keeps it simple). On success the returned public URL + token are stored and
-    /// the QR modal is opened. Errors land in `message`.
+    /// Start remote access via the loopback control plane (`POST /api/remote/start`)
+    /// using the daemon's PRE-CONFIGURED tunnel: an empty provider + field map tells
+    /// the daemon to fall back to its `lucarned.yaml` config (G3). Thin wrapper over
+    /// [`Self::start_with`] with empty params — kept as the "just go public with
+    /// whatever the daemon already has" convenience.
+    ///
+    /// The interactive `s` key no longer calls this directly: the [`App`] bridges
+    /// the Config panel's live params into [`Self::start_with`] (PART 1), and an
+    /// empty Config yields empty params (the same daemon-default fallback). This
+    /// method stays for callers / future entry points that want the daemon default
+    /// unconditionally without consulting the Config panel.
+    ///
+    /// [`App`]: crate::tui::app::App
+    #[allow(dead_code)]
     pub fn start(&mut self) {
-        // v1: trigger the daemon's pre-configured tunnel (empty provider/fields).
-        // The panel assembles the plan inline; a future task can feed provider +
-        // fields collected by the Config panel.
+        self.start_with(String::new(), std::collections::BTreeMap::new());
+    }
+
+    /// Start remote access via the loopback control plane (`POST /api/remote/start`)
+    /// with an EXPLICIT provider + field map (PART 1: wired from the Config panel's
+    /// live in-TUI edits via [`crate::tui::config::ConfigPanel::start_params`]). The
+    /// daemon merges these over its pre-config (G3), so "configure in Config, then
+    /// `s` in Go Public" works without saving `lucarned.yaml` first.
+    ///
+    /// An EMPTY `provider` (with empty `fields`) means "use the daemon's
+    /// pre-configured tunnel" (the v1 behavior). When a provider id IS set it is
+    /// validated against its descriptor first; an invalid config surfaces inline in
+    /// `message` and NOTHING is sent. On success the returned public URL + token are
+    /// stored and the QR modal is opened. Other errors land in `message`.
+    pub fn start_with(
+        &mut self,
+        provider: String,
+        fields: std::collections::BTreeMap<String, String>,
+    ) {
+        // Validate a non-empty provider's config against its descriptor before
+        // touching the network, so a missing required field is caught inline rather
+        // than as a daemon 400 (the provider boundary stays in lucarne_remote).
+        if !provider.is_empty() {
+            if let Err(detail) = validate_start_config(&provider, &fields) {
+                self.message = Some(format!("start blocked — {detail}"));
+                return;
+            }
+        }
         let plan = GoPublicPlan {
-            provider: String::new(),
-            fields: std::collections::BTreeMap::new(),
+            provider,
+            fields,
             control_url: control_url(self.control_port, "start"),
         };
         match call_remote_start(&plan) {
@@ -381,11 +420,19 @@ impl GoPublicPanel {
         }
     }
 
-    /// Handle a key for the Go-Public panel. `s` start, `x` stop, `r` refresh
-    /// status, `Enter` (re)open the login QR modal when a login is available, and
-    /// `Esc`/`q` close the modal. Returns a [`GoPublicAction`] for uniformity with
-    /// the Sessions panel (no deferred work today).
-    pub fn handle_key(&mut self, code: crossterm::event::KeyCode) -> GoPublicAction {
+    /// Handle a key for the Go-Public panel. `x` stop, `r` refresh status, `Enter`
+    /// (re)open the login QR modal when a login is available, and `Esc`/`q` close
+    /// the modal.
+    ///
+    /// NOTE: the `s` (start) key is deliberately NOT handled here — the [`App`] owns
+    /// both this panel and the Config panel, so it intercepts `s` and calls
+    /// [`Self::start_with`] using the Config panel's live
+    /// [`start_params`](crate::tui::config::ConfigPanel::start_params) (PART 1).
+    /// This handler can therefore stay panel-local with no return value (MNT-005:
+    /// the single-variant `GoPublicAction` is gone).
+    ///
+    /// [`App`]: crate::tui::app::App
+    pub fn handle_key(&mut self, code: crossterm::event::KeyCode) {
         use crossterm::event::KeyCode;
 
         // While the modal is open, Esc/q just closes it (the loop maps q→quit only
@@ -394,10 +441,9 @@ impl GoPublicPanel {
             if matches!(code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter) {
                 self.qr_open = false;
             }
-            return GoPublicAction::None;
+            return;
         }
         match code {
-            KeyCode::Char('s') => self.start(),
             KeyCode::Char('x') => self.stop(),
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Enter => {
@@ -410,7 +456,6 @@ impl GoPublicPanel {
             }
             _ => {}
         }
-        GoPublicAction::None
     }
 }
 
@@ -469,8 +514,12 @@ pub fn render_qr_modal(frame: &mut Frame, panel: &GoPublicPanel, area: Rect) {
         }
         Err(e) => {
             // QR generation failed (e.g. data too long) — show the plain URL.
+            // COR-004: size the modal by the login's CHAR count (matching
+            // `QrGrid::measure`), not its byte length — a multi-byte URL would
+            // otherwise over-size the modal via the lossy `len() as u16`.
             let body = format!("QR render failed: {e}\n\nlogin URL:\n{login}");
-            let modal = centered_rect((login.len() as u16).saturating_add(4).min(area.width), 6, area);
+            let login_cols = login.chars().count().min(u16::MAX as usize) as u16;
+            let modal = centered_rect(login_cols.saturating_add(4).min(area.width), 6, area);
             frame.render_widget(Clear, modal);
             let widget = Paragraph::new(body)
                 .block(block)
@@ -698,10 +747,10 @@ mod go_public_tests {
         let mut panel = GoPublicPanel::new();
         panel.status = Some(status(true, Some("https://demo.example.test"), Some("k")));
         // Enter opens the modal when a login is available.
-        assert_eq!(panel.handle_key(KeyCode::Enter), GoPublicAction::None);
+        panel.handle_key(KeyCode::Enter);
         assert!(panel.qr_open);
         // While open, Esc closes it.
-        assert_eq!(panel.handle_key(KeyCode::Esc), GoPublicAction::None);
+        panel.handle_key(KeyCode::Esc);
         assert!(!panel.qr_open);
         // Enter with no login available sets a hint instead of opening.
         let mut empty = GoPublicPanel::new();

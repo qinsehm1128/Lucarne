@@ -8,16 +8,30 @@
 //! r=refresh); a panel may ask the loop to perform deferred work (the attach
 //! pop-out handoff) via the returned [`SessionAction`].
 
+use std::time::Duration;
+
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use super::app::App;
 use super::sessions::SessionAction;
 
-/// Block until the next terminal event and apply it to `app`. Returns the panel
-/// [`SessionAction`] the caller must act on (the attach pop-out handoff needs the
-/// terminal owner). The caller also checks `app.running` to decide whether to
-/// keep looping. Non-key events (resize, mouse) are ignored — the next draw
-/// handles a resize.
+/// COR-003: poll for a terminal event for up to one second, returning whether one
+/// is now ready to [`read`](event::read). The 1s timeout (not a spin) lets the loop
+/// redraw periodically (e.g. to reflect an out-of-band status change) without
+/// busy-waiting — when this returns `false` the caller simply redraws and polls
+/// again; when it returns `true` the caller drives [`handle_next`].
+pub fn poll_ready() -> std::io::Result<bool> {
+    event::poll(Duration::from_millis(1000))
+}
+
+/// Read the next (already-[`poll_ready`]'d) terminal event and apply it to `app`.
+/// Returns the panel [`SessionAction`] the caller must act on (the attach pop-out
+/// handoff needs the terminal owner). The caller also checks `app.running` to
+/// decide whether to keep looping. Non-key events (resize, mouse) are ignored —
+/// the next draw handles a resize.
+///
+/// MUST be called only after [`poll_ready`] returned `true` so the underlying
+/// [`event::read`] does not block the loop (COR-003).
 pub fn handle_next(app: &mut App) -> std::io::Result<SessionAction> {
     match event::read()? {
         Event::Key(key) if key.kind == KeyEventKind::Press => {

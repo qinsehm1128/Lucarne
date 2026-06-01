@@ -16,6 +16,7 @@
 pub mod app;
 pub mod config;
 pub mod event;
+pub mod nav;
 pub mod remote;
 pub mod sessions;
 pub mod ui;
@@ -64,24 +65,42 @@ pub fn run() -> Result<(), String> {
     result.and(restore)
 }
 
-/// The draw/event loop. Draws a frame, then blocks for one key event, until the
-/// app requests to quit. A Sessions-panel attach request triggers the pop-out
-/// handoff (suspend → run `rmux attach-session` → resume), which lives in the
-/// sessions module so the loop never learns rmux/terminal-handoff specifics.
+/// The draw/event loop. Draws the FIRST frame BEFORE the initial (blocking)
+/// control-plane refresh so startup paints immediately instead of stalling on a
+/// cold/missing daemon (COR-003). It then polls for input with a 1s timeout
+/// ([`event::poll_ready`]) and only `read`s when an event is ready, redrawing on
+/// each timeout, until the app requests to quit — so the loop neither blocks
+/// indefinitely on `read()` nor busy-spins. A Sessions-panel attach request
+/// triggers the pop-out handoff (suspend → run `rmux attach-session` → resume),
+/// which lives in the sessions module so the loop never learns
+/// rmux/terminal-handoff specifics.
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<(), String> {
     let mut app = App::new();
     // Populate the session list before the first draw (construction is I/O-free).
     app.sessions.refresh();
-    // Pull the current remote-access status so the Go-Public panel opens informed
-    // (a missing/cold daemon just lands an error in its message line — no panic).
-    app.go_public.refresh();
     // Resolve the lucarned.yaml path + seed the Config panel from its current
     // remote: section (a missing file just opens the form with defaults).
     app.config.load();
+
+    // COR-003: paint the FIRST frame BEFORE the initial blocking control-plane
+    // refresh, so a cold/unreachable daemon does not stall the very first paint.
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .map_err(|e| format!("draw failed: {e}"))?;
+    // Now pull the current remote-access status so the Go-Public panel opens
+    // informed (a missing/cold daemon just lands an error in its message line —
+    // no panic); the next draw below reflects it.
+    app.go_public.refresh();
+
     while app.running {
         terminal
             .draw(|frame| ui::draw(frame, &mut app))
             .map_err(|e| format!("draw failed: {e}"))?;
+        // COR-003: poll with a 1s timeout (blocks, no busy-loop). On timeout we
+        // fall through and redraw; only on a ready event do we `read` + handle it.
+        if !event::poll_ready().map_err(|e| format!("event poll failed: {e}"))? {
+            continue;
+        }
         match event::handle_next(&mut app).map_err(|e| format!("event read failed: {e}"))? {
             sessions::SessionAction::Attach(name) => {
                 sessions::attach_handoff(terminal, &mut app.sessions, &name)?

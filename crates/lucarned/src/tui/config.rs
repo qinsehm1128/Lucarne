@@ -172,6 +172,27 @@ impl ConfigPanel {
         Self::default()
     }
 
+    /// The live start parameters the Go-Public panel's `s` key should use (PART 1):
+    /// the currently-selected provider id and its NON-EMPTY field values, taken
+    /// straight from the in-TUI edit buffer (no `lucarned.yaml` save required). The
+    /// daemon merges these over its pre-config (G3), so configuring here and then
+    /// pressing `s` in Go Public "configures + goes public" entirely inside the TUI.
+    ///
+    /// Pure + I/O-free: empty field values are skipped so a blank optional field
+    /// never shadows a daemon default. An empty `provider` (the degenerate
+    /// no-registered-providers case) yields empty params → the daemon falls back to
+    /// its pre-configured tunnel.
+    pub fn start_params(&self) -> (String, BTreeMap<String, String>) {
+        let fields = self
+            .edits
+            .fields
+            .iter()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        (self.edits.provider.clone(), fields)
+    }
+
     /// Resolve the daemon config path (`$LUCARNE_CONFIG`/`$LUCARNED_CONFIG` or
     /// `~/.lucarned/lucarned.yaml`) and seed the edit buffer from its current
     /// `remote:` section when the file exists. Never panics on a missing file —
@@ -260,12 +281,16 @@ impl ConfigPanel {
     }
 
     /// Rebuild the form rows for the currently-selected provider and clamp the
-    /// cursor back into range.
+    /// cursor back into range via the shared [`super::nav::clamp`]
+    /// ([`super::nav::EmptyPolicy::SelectFirst`]: a non-empty form always keeps a
+    /// focused row; an empty form clears the selection).
     fn reload_rows(&mut self) {
         self.rows = build_rows(self.edits.provider.as_str());
-        let selected = self.list.selected().unwrap_or(0).min(self.rows.len().saturating_sub(1));
-        self.list
-            .select((!self.rows.is_empty()).then_some(selected));
+        super::nav::clamp(
+            &mut self.list,
+            self.rows.len(),
+            super::nav::EmptyPolicy::SelectFirst,
+        );
     }
 
     /// The display string for the row under the cursor (used by the renderer).
@@ -273,26 +298,22 @@ impl ConfigPanel {
         display_value(row, &self.edits)
     }
 
-    /// Move the cursor down one row (clamped; ignored while editing).
+    /// Move the cursor down one row (clamped; ignored while editing). Delegates the
+    /// clamp/step to the shared [`super::nav::step`].
     pub fn select_next(&mut self) {
-        if self.editing.is_some() || self.rows.is_empty() {
+        if self.editing.is_some() {
             return;
         }
-        let next = self
-            .list
-            .selected()
-            .map(|i| (i + 1).min(self.rows.len() - 1))
-            .unwrap_or(0);
-        self.list.select(Some(next));
+        super::nav::step(&mut self.list, self.rows.len(), true);
     }
 
-    /// Move the cursor up one row (clamped; ignored while editing).
+    /// Move the cursor up one row (clamped; ignored while editing). Delegates the
+    /// clamp/step to the shared [`super::nav::step`].
     pub fn select_previous(&mut self) {
-        if self.editing.is_some() || self.rows.is_empty() {
+        if self.editing.is_some() {
             return;
         }
-        let prev = self.list.selected().map(|i| i.saturating_sub(1)).unwrap_or(0);
-        self.list.select(Some(prev));
+        super::nav::step(&mut self.list, self.rows.len(), false);
     }
 
     /// The row currently under the cursor, if any.
@@ -1034,5 +1055,31 @@ channels:
         if let Row::Field { key, .. } = row {
             assert_eq!(panel.edits.fields.get(key).map(String::as_str), Some("tok123"));
         }
+    }
+
+    #[test]
+    fn start_params_returns_provider_and_non_empty_fields() {
+        // PART 1: the Go-Public `s` key starts with the Config panel's live edits.
+        // `start_params` returns the selected provider id + only its NON-EMPTY
+        // field values (empties are skipped so they never shadow a daemon default).
+        let mut panel = ConfigPanel::new();
+        panel.edits.provider = "cloudflared".to_string();
+        panel
+            .edits
+            .fields
+            .insert("token".to_string(), "tok-123".to_string());
+        // A blank field must be skipped, not forwarded as "".
+        panel
+            .edits
+            .fields
+            .insert("public_url".to_string(), String::new());
+
+        let (provider, fields) = panel.start_params();
+        assert_eq!(provider, "cloudflared");
+        assert_eq!(fields.get("token").map(String::as_str), Some("tok-123"));
+        assert!(
+            !fields.contains_key("public_url"),
+            "empty field values must be skipped"
+        );
     }
 }

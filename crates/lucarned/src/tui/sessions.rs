@@ -20,6 +20,11 @@ use std::process::Command;
 
 use ratatui::{backend::CrosstermBackend, widgets::ListState, Terminal};
 
+/// Operator hint shown when `rmux list-sessions` could not be reached (COR-005):
+/// an empty list then means "rmux is down", not "no sessions". Shared by the
+/// refresh status line and the empty-state render so the message is identical.
+pub const RMUX_UNREACHABLE_HINT: &str = "rmux unreachable — is the rmux daemon running?";
+
 /// Resolve the `rmux` binary, preferring `~/.cargo/bin/rmux` (the path a
 /// `cargo install rmux` lands on) before falling back to `$PATH`.
 pub fn rmux_bin() -> String {
@@ -257,8 +262,10 @@ pub enum SessionAction {
     Attach(String),
 }
 
-/// The Sessions panel state: the parsed session list, its `ListState`, and a
-/// transient status line for action feedback (archive id, errors, hints).
+/// The Sessions panel state: the parsed session list, its `ListState`, a
+/// transient status line for action feedback (archive id, errors, hints), and
+/// whether the last `rmux list-sessions` call was UNREACHABLE (COR-005) — so the
+/// renderer can distinguish "rmux is down" from "rmux is up but has no sessions".
 #[derive(Default)]
 pub struct SessionsPanel {
     /// Sessions parsed from the last `rmux list-sessions`.
@@ -267,6 +274,11 @@ pub struct SessionsPanel {
     pub list: ListState,
     /// Last action result / hint, shown in the detail pane.
     pub status: Option<String>,
+    /// COR-005: `true` when the last [`refresh`](Self::refresh) could not reach the
+    /// rmux daemon (the `list-sessions` call returned `None` / non-zero), so an
+    /// empty `sessions` means "unreachable", not "no sessions". `false` after a
+    /// successful call (even one that returns zero sessions).
+    pub rmux_unreachable: bool,
 }
 
 impl SessionsPanel {
@@ -278,13 +290,23 @@ impl SessionsPanel {
     }
 
     /// Re-run `rmux list-sessions` and re-parse, then re-clamp the selection so an
-    /// index is never left past the (possibly shorter) new list. A missing daemon
-    /// / empty list yields an empty list and a `None` selection (no panic).
+    /// index is never left past the (possibly shorter) new list. COR-005: a
+    /// successful-but-empty result (`Some(out)` parsing to zero rows) sets
+    /// [`rmux_unreachable`](Self::rmux_unreachable) `false` (genuinely no sessions),
+    /// while a failed call (`None` — missing/non-zero rmux) sets it `true` so the
+    /// renderer can tell "rmux is down" apart from "rmux is up but empty". Never
+    /// panics.
     pub fn refresh(&mut self) {
-        self.sessions = match list_sessions_raw() {
-            Some(out) => parse_sessions(&out),
-            None => Vec::new(),
-        };
+        match list_sessions_raw() {
+            Some(out) => {
+                self.sessions = parse_sessions(&out);
+                self.rmux_unreachable = false;
+            }
+            None => {
+                self.sessions = Vec::new();
+                self.rmux_unreachable = true;
+            }
+        }
         self.clamp_selection();
     }
 
@@ -297,43 +319,28 @@ impl SessionsPanel {
     }
 
     /// Move the selection down one row, clamped to the list length. No-op (and no
-    /// panic) on an empty list.
+    /// panic) on an empty list. Delegates to the shared [`super::nav::step`].
     pub fn select_next(&mut self) {
-        if self.sessions.is_empty() {
-            self.list.select(None);
-            return;
-        }
-        let next = match self.list.selected() {
-            Some(i) if i + 1 < self.sessions.len() => i + 1,
-            Some(i) => i, // already at the bottom — stay put
-            None => 0,
-        };
-        self.list.select(Some(next));
+        super::nav::step(&mut self.list, self.sessions.len(), true);
     }
 
     /// Move the selection up one row, clamped at the top. No-op on an empty list.
+    /// Delegates to the shared [`super::nav::step`].
     pub fn select_previous(&mut self) {
-        if self.sessions.is_empty() {
-            self.list.select(None);
-            return;
-        }
-        let prev = match self.list.selected() {
-            Some(0) | None => 0,
-            Some(i) => i - 1,
-        };
-        self.list.select(Some(prev));
+        super::nav::step(&mut self.list, self.sessions.len(), false);
     }
 
     /// Clamp the selection into `[0, len)` (or `None` on an empty list) so a stale
-    /// index after a kill/archive can never be rendered out of bounds.
+    /// index after a kill/archive can never be rendered out of bounds. Uses the
+    /// shared [`super::nav::clamp`] with [`super::nav::EmptyPolicy::SelectFirst`]
+    /// so a refresh of a non-empty list with no selection lands on the first row
+    /// (preserving the prior behavior of seeding index 0).
     fn clamp_selection(&mut self) {
-        let len = self.sessions.len();
-        match self.list.selected() {
-            _ if len == 0 => self.list.select(None),
-            Some(i) if i >= len => self.list.select(Some(len - 1)),
-            Some(_) => {}
-            None => self.list.select(Some(0)),
-        }
+        super::nav::clamp(
+            &mut self.list,
+            self.sessions.len(),
+            super::nav::EmptyPolicy::SelectFirst,
+        );
     }
 
     /// Handle a key for the Sessions panel. Inline actions (detach/kill/archive)
@@ -357,7 +364,11 @@ impl SessionsPanel {
             KeyCode::Char('a') => self.archive_selected(),
             KeyCode::Char('r') => {
                 self.refresh();
-                self.status = Some(format!("refreshed — {} session(s)", self.sessions.len()));
+                self.status = Some(if self.rmux_unreachable {
+                    RMUX_UNREACHABLE_HINT.to_string()
+                } else {
+                    format!("refreshed — {} session(s)", self.sessions.len())
+                });
             }
             _ => return SessionAction::None,
         }
@@ -429,6 +440,7 @@ mod tests {
             sessions,
             list,
             status: None,
+            rmux_unreachable: false,
         }
     }
 
@@ -538,5 +550,45 @@ mod tests {
     fn unhandled_key_returns_none() {
         let mut panel = panel_with(&["work"]);
         assert_eq!(panel.handle_key(KeyCode::Char('z')), SessionAction::None);
+    }
+
+    #[test]
+    fn empty_distinguishes_reachable_from_unreachable() {
+        // COR-005: a successful `rmux list-sessions` that parses to zero rows is a
+        // genuinely-empty list (reachable); a None call (rmux down) is unreachable.
+        // Both end with an empty `sessions`, but the flag tells them apart so the
+        // renderer can pick the right message.
+
+        // Reachable-but-empty: a successful call returning no session lines.
+        assert!(
+            parse_sessions("").is_empty(),
+            "a successful empty output parses to zero sessions"
+        );
+        let reachable_empty = {
+            // Simulate what refresh() does for `Some("")`: empty list + reachable.
+            let mut p = panel_with(&["stale"]);
+            p.sessions = parse_sessions("");
+            p.rmux_unreachable = false;
+            p.clamp_selection();
+            p
+        };
+        assert!(reachable_empty.sessions.is_empty());
+        assert!(
+            !reachable_empty.rmux_unreachable,
+            "a reachable-but-empty list must NOT be flagged unreachable"
+        );
+
+        // Unreachable: simulate what refresh() does for `None` (rmux down).
+        let mut unreachable = panel_with(&["stale"]);
+        unreachable.sessions = Vec::new();
+        unreachable.rmux_unreachable = true;
+        unreachable.clamp_selection();
+        assert!(unreachable.sessions.is_empty());
+        assert!(
+            unreachable.rmux_unreachable,
+            "a failed (None) list call must be flagged unreachable"
+        );
+        // The hint the renderer shows is the shared constant.
+        assert!(RMUX_UNREACHABLE_HINT.contains("rmux unreachable"));
     }
 }

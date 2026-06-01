@@ -43,12 +43,14 @@ fn draw_panel_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|panel| ListItem::new(Line::from(panel.title())))
         .collect();
 
-    // Index-bound guard: never leave a selection past the end of the list.
-    if let Some(idx) = app.list.selected() {
-        if idx >= items.len() {
-            app.list.select(items.len().checked_sub(1));
-        }
-    }
+    // Index-bound guard: never leave a selection past the end of the list. Uses
+    // the shared nav clamp (KeepNone: the panel selector mirrors `active` and is
+    // never legitimately unselected, so a bare clamp must not invent a selection).
+    super::nav::clamp(
+        &mut app.list,
+        items.len(),
+        super::nav::EmptyPolicy::KeepNone,
+    );
 
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title("lucarned"))
@@ -84,7 +86,18 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
         .title(Panel::Sessions.title());
 
     if panel.sessions.is_empty() {
-        let empty = Paragraph::new("No running rmux sessions.\n\nPress r to refresh.").block(block);
+        // COR-005: distinguish "rmux is down" (the last refresh could not reach the
+        // daemon) from "rmux is up but has no sessions". Both render an empty list,
+        // but the message differs so the operator knows whether to start the daemon.
+        let body = if panel.rmux_unreachable {
+            format!(
+                "{}\n\nStart the rmux daemon, then press r to refresh.",
+                super::sessions::RMUX_UNREACHABLE_HINT
+            )
+        } else {
+            "No running rmux sessions.\n\nPress r to refresh.".to_string()
+        };
+        let empty = Paragraph::new(body).block(block);
         frame.render_widget(empty, list_area);
     } else {
         let items: Vec<ListItem> = panel
@@ -118,10 +131,25 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// Go-Public panel detail: the current tunnel status + last action message, the
-/// public URL + access token when up, and the centered high-contrast login-QR
-/// modal overlaid when open (TASK-003). All control-plane / QR specifics live in
-/// [`super::remote`]; this only lays out the body and asks it to draw the modal.
+/// public URL + access token when up, the START SOURCE line (PART 1: whether `s`
+/// will use the Config panel's live provider/fields or the daemon default), and
+/// the centered high-contrast login-QR modal overlaid when open (TASK-003). All
+/// control-plane / QR specifics live in [`super::remote`]; this only lays out the
+/// body and asks it to draw the modal.
 fn draw_go_public(frame: &mut Frame, app: &mut App, area: Rect) {
+    // PART 1: read the Config panel's live start params (read-only, at draw time)
+    // so the operator sees exactly what `s` will start with — their in-TUI Config
+    // when a provider is set, or the daemon's pre-configured tunnel when empty.
+    let (start_provider, start_fields) = app.config.start_params();
+    let start_source = if start_provider.is_empty() {
+        "start uses daemon default (no provider set in Config)".to_string()
+    } else {
+        format!(
+            "start uses Config: provider={start_provider} ({} fields)",
+            start_fields.len()
+        )
+    };
+
     let panel = &app.go_public;
 
     let running = panel.status.as_ref().map(|s| s.running).unwrap_or(false);
@@ -140,7 +168,8 @@ fn draw_go_public(frame: &mut Frame, app: &mut App, area: Rect) {
         "Remote access: {state}\n\
          control plane: 127.0.0.1:{port}\n\
          public URL: {public_url}\n\
-         access token: {token}\n\n\
+         access token: {token}\n\
+         {start_source}\n\n\
          {message}",
         state = if running { "RUNNING" } else { "stopped" },
         port = panel.control_port,

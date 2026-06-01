@@ -128,14 +128,30 @@ impl App {
 
     /// Dispatch a non-navigation key to the active panel. Returns the panel's
     /// [`SessionAction`] so the event loop can perform deferred work (the attach
-    /// pop-out handoff) that needs the terminal owner. The Go-Public panel runs
-    /// its actions (start/stop/status/QR) inline and has no deferred work, so it
-    /// always resolves to [`SessionAction::None`].
+    /// pop-out handoff) that needs the terminal owner. The Sessions panel is the
+    /// only one with deferred work; the Go-Public and Config panels run inline and
+    /// always resolve to [`SessionAction::None`].
+    ///
+    /// PART 1: when the Go-Public panel is active and the key is `s` (start), the
+    /// App BRIDGES the two panels it owns — it reads the Config panel's live
+    /// [`start_params`](ConfigPanel::start_params) and drives
+    /// [`GoPublicPanel::start_with`] with them, so the operator's in-TUI provider +
+    /// fields are used without saving `lucarned.yaml` first (an empty Config →
+    /// empty params → the daemon's pre-configured tunnel). Every other Go-Public
+    /// key (`x`/`r`/`Enter`/`Esc`) is routed to the panel as before.
     pub fn handle_panel_key(&mut self, code: crossterm::event::KeyCode) -> SessionAction {
+        use crossterm::event::KeyCode;
         match self.active {
             Panel::Sessions => self.sessions.handle_key(code),
             Panel::GoPublic => {
-                self.go_public.handle_key(code);
+                // Bridge: `s` starts using the Config panel's live edits (PART 1);
+                // the QR modal (when open) still consumes keys via handle_key below.
+                if code == KeyCode::Char('s') && !self.go_public.qr_open {
+                    let (provider, fields) = self.config.start_params();
+                    self.go_public.start_with(provider, fields);
+                } else {
+                    self.go_public.handle_key(code);
+                }
                 SessionAction::None
             }
             Panel::Config => {
@@ -211,5 +227,41 @@ mod tests {
         assert!(app.running);
         app.quit();
         assert!(!app.running);
+    }
+
+    #[test]
+    fn go_public_start_uses_config_params_and_validation_blocks_bad_config() {
+        // PART 1: pressing `s` on the Go-Public panel must bridge through the App to
+        // the Config panel's live start_params. When the Config provider has a
+        // missing REQUIRED field, the provider's validate_config rejects it inline
+        // and NOTHING is sent (no daemon needed for this path).
+        use crossterm::event::KeyCode;
+        let mut app = App::new();
+        app.active = Panel::GoPublic;
+
+        // Configure cloudflared with NO fields. cloudflared requires a tunnel
+        // `token` for a named tunnel; with a token absent but a public_url present
+        // it would be invalid — but more simply, drive a config the descriptor
+        // rejects. We set a provider + a token-gated public_url is required when a
+        // token is set, so set a token and omit the conditionally-required field.
+        app.config.edits.provider = "cloudflared".to_string();
+        app.config
+            .edits
+            .fields
+            .insert("token".to_string(), "abc".to_string());
+        // The conditional `public_url` (required_when token present) is omitted, so
+        // validate_config must fail and block the start before any network call.
+
+        let before = app.go_public.message.clone();
+        app.handle_panel_key(KeyCode::Char('s'));
+        let msg = app.go_public.message.clone();
+        assert_ne!(msg, before, "a blocked start must surface a message");
+        assert!(
+            msg.as_deref().unwrap_or("").starts_with("start blocked — "),
+            "validation failure must block + surface inline, got: {msg:?}"
+        );
+        // No tunnel status was set (the start was blocked before sending).
+        assert!(app.go_public.status.is_none());
+        assert!(!app.go_public.qr_open);
     }
 }
