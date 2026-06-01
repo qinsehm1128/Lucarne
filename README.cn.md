@@ -176,24 +176,34 @@ Telegram 入口 chat 需要开启 Topics/Thread mode。可以直接使用 Bot �
 Telegram workspace 映射为 Forum Topic。一个项目一个 topic；一个 topic 可绑定一个 live Agent session。
 - Telegram支持WeChat所有功能
 
-### 终端监控与 `term` CLI（可选）
+### 终端监控与 `lucarned tui` 控制台（可选）
 
 终端监控子系统是 feature-gated 的，默认关闭。用 `--features remote` 构建 daemon
 即可启用。它把系统级 rmux daemon 上的会话镜像到 web 终端视图，提供一个由 Lucarne
 agent session 支撑的 web chat 视图，并允许把某个会话弹出到本地终端、再收回，而远程
 镜像保持运行。
 
-轻量 `term` CLI 操作同一个 rmux daemon 与共享 archive store：
+`lucarned tui` 是本地操作者的唯一交互入口：一个全屏、方向键导航的控制台，构建在
+`tui` feature（隐含 `remote`）之下，替代了旧的独立 `term` CLI。构建并启动：
 
 ```bash
-term ls                 # 列出终端会话
-term attach <id>        # 把会话弹出到本地终端
-term detach <id>        # 收回（远程镜像继续运行）
-term go-public          # 通过远程接入隧道把 web 视图对外暴露
+cargo +nightly build --features tui      # 构建控制台
+lucarned tui                             # 启动全屏控制台
 ```
 
-`term go-public` 会枚举内置隧道 provider（Cloudflared 优先），无回显地提示输入所需
-密钥，并打印登录 URL 的终端二维码，让手机能远程访问终端与 chat 视图。
+控制台有三个面板（`Tab` / `←` `→` 切换面板，`↑` `↓` 移动选项，`q` / `Esc` 退出）：
+
+- **Sessions（会话）** — 列出系统级 rmux 会话；`Enter` attach（把会话弹出到本地终端，
+  detach 后回到控制台），`d` detach，`k` / `Del` kill，`a` archive 到共享 archive
+  store，`r` 刷新。
+- **Go Public（对外暴露）** — `s` 启动远程接入隧道，`x` 停止，`r` 查询状态，`Enter`
+  弹出登录 URL 的高对比二维码模态，让手机能远程访问终端与 chat 视图（终端太小无法画出
+  可扫码二维码时回退为纯 URL）。
+- **Config（配置）** — 编辑远程接入 provider 字段（Cloudflared 优先），密钥字段掩码
+  显示且永不回显，保存时写回 `lucarned.yaml` 并生成带时间戳的备份。
+
+默认 daemon 构建（不带 `--features tui`）不会编译或链接任何 TUI 栈 —— 没有 `ratatui`、
+没有 `crossterm`、没有 rmux 绑定 —— 常驻 daemon 始终是纯消息桥。
 
 
 ---
@@ -238,7 +248,7 @@ chat 桥，全部可通过隧道远程访问。默认 daemon 构建不会编译�
    ┌──────┴───────┐
    │ 系统 rmux    │   lucarne-remote     ← go-public 隧道注册表（Cloudflared 优先）
    │   daemon     │
-   └──────────────┘   term CLI           ← 轻量 `term` CLI：list / attach / detach / go-public
+   └──────────────┘   lucarned tui        ← 唯一交互入口：sessions / go-public / config
 ```
 
 ---

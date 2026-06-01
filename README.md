@@ -176,7 +176,7 @@ Telegram needs Topics/thread mode for the entry chat. A private chat with the bo
 Telegram workspaces map to Forum Topics. One project gets one topic; one topic can bind one live agent session.
 - Telegram supports every WeChat feature.
 
-### Terminal monitor and the `term` CLI (optional)
+### Terminal monitor and the `lucarned tui` dashboard (optional)
 
 The terminal-monitor subsystem is feature-gated and off by default. Build the
 daemon with `--features remote` to enable it. It mirrors the sessions on your
@@ -184,18 +184,33 @@ system-wide rmux daemon to a web terminal view, hosts a web chat view backed by
 a Lucarne agent session, and lets a session be popped into your local terminal
 and retracted again while the remote mirror keeps running.
 
-The thin `term` CLI drives the same rmux daemon and the shared archive store:
+`lucarned tui` is the single interactive entry for the local operator. It is a
+full-screen, arrow-key-navigable dashboard built behind the `tui` feature (which
+implies `remote`); it replaces the old standalone `term` CLI. Build and launch
+it with:
 
 ```bash
-term ls                 # list terminal sessions
-term attach <id>        # pop a session into your local terminal
-term detach <id>        # retract it (the remote mirror keeps running)
-term go-public          # expose the web view through a remote-access tunnel
+cargo +nightly build --features tui      # build the dashboard
+lucarned tui                             # launch the full-screen dashboard
 ```
 
-`term go-public` enumerates the built-in tunnel providers (Cloudflared-first),
-prompts for any required secret without echoing it, and prints a terminal QR of
-the login URL so a phone can reach the terminal and chat views remotely.
+The dashboard has three panels (switch with `Tab` / `←` `→`, navigate items with
+`↑` `↓`, quit with `q` / `Esc`):
+
+- **Sessions** — lists your system-wide rmux sessions; `Enter` attaches (pops the
+  session into your terminal and returns to the dashboard on detach), `d` detaches,
+  `k` / `Del` kills, `a` archives to the shared archive store, `r` refreshes.
+- **Go Public** — `s` starts the remote-access tunnel, `x` stops it, `r` checks
+  status, and `Enter` shows a high-contrast QR modal of the login URL so a phone
+  can reach the terminal and chat views remotely (it falls back to the plain URL
+  when the terminal is too small to draw a scannable QR).
+- **Config** — edits the remote-access provider fields (Cloudflared-first) with
+  secret fields masked and never echoed, and saves back to `lucarned.yaml` with a
+  timestamped backup.
+
+Default daemon builds (no `--features tui`) compile and link none of the TUI
+stack — no `ratatui`, no `crossterm`, no rmux binding — so the resident daemon
+stays a pure message bridge.
 
 ---
 
@@ -240,7 +255,7 @@ tunnel. Default daemon builds never compile or link any of it.
    ┌──────┴───────┐
    │ system rmux  │   lucarne-remote     ← go-public tunnel registry (Cloudflared-first)
    │   daemon     │
-   └──────────────┘   term CLI           ← Thin `term` CLI: list / attach / detach / go-public
+   └──────────────┘   lucarned tui        ← Single interactive entry: sessions / go-public / config
 ```
 
 ---

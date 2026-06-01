@@ -31,6 +31,8 @@ mod health;
 mod onboarding;
 #[cfg(feature = "remote")]
 mod remote;
+#[cfg(feature = "tui")]
+mod tui;
 
 const DEFAULT_LOG_BUFFERED_LINES: usize = 1024;
 const DEFAULT_LOG_MAX_FILES: usize = 16;
@@ -168,6 +170,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         lucarned_ctl::Command::Doctor | lucarned_ctl::Command::Update => {
             run_ctl_network_command(command).await
         }
+        // The interactive TUI owns the `tui` feature (ratatui/crossterm + the
+        // migrated term helpers). In a `--features tui` build it launches the
+        // full-screen dashboard; without the feature it falls through to
+        // `lucarned_ctl::run`, which returns a clear "rebuild with --features
+        // tui" error.
+        // The TUI is fully synchronous and uses `reqwest::blocking` for its
+        // loopback control-plane calls. `reqwest::blocking` builds and drops its
+        // own current-thread Tokio runtime; dropping a runtime inside this
+        // `#[tokio::main]` async context panics ("Cannot drop a runtime in a
+        // context where blocking is not allowed"). Run the whole TUI on a
+        // dedicated OS thread with no ambient runtime so the blocking client is
+        // safe. The panic hook installed in `tui::run` is process-global, so a
+        // panic on that thread still restores the terminal.
+        #[cfg(feature = "tui")]
+        lucarned_ctl::Command::Tui => std::thread::spawn(tui::run)
+            .join()
+            .unwrap_or_else(|_| Err("tui thread panicked".to_string()))
+            .map_err(|err| -> Box<dyn std::error::Error> {
+                std::io::Error::new(std::io::ErrorKind::Other, err).into()
+            }),
         command => lucarned_ctl::run(command)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err).into()),
     }
@@ -1485,6 +1507,26 @@ mod tests {
     }
 
     #[test]
+    fn tui_dispatch_runs_on_a_dedicated_thread_off_the_tokio_runtime() {
+        // Regression guard for the `lucarned tui` startup panic
+        // ("Cannot drop a runtime in a context where blocking is not allowed"):
+        // the TUI uses `reqwest::blocking`, which builds+drops its own runtime,
+        // so it MUST NOT run inside the `#[tokio::main]` async context. The Tui
+        // dispatch arm must hand off to a dedicated OS thread.
+        let source = include_str!("main.rs");
+        let compact_source = source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+
+        assert!(
+            compact_source.contains("Command::Tui=>std::thread::spawn(tui::run)"),
+            "the `Command::Tui` arm must run `tui::run` on a dedicated thread, \
+             not inside the tokio runtime"
+        );
+    }
+
+    #[test]
     fn memory_profile_snapshots_are_feature_gated() {
         let manifest = include_str!("../Cargo.toml");
         let source = include_str!("main.rs");
@@ -2041,6 +2083,9 @@ health:
         );
     }
 
+    // Exercises `resolve_provider_fields`, which is `#[cfg(feature = "remote")]`;
+    // gate the test to match so the default (no-feature) build still compiles.
+    #[cfg(feature = "remote")]
     #[test]
     fn default_config_parses_including_remote_providers() {
         // Regression guard: the bootstrapped default config (which writes
@@ -2067,6 +2112,9 @@ health:
         );
     }
 
+    // Exercises `resolve_provider_fields`, which is `#[cfg(feature = "remote")]`;
+    // gate the test to match so the default (no-feature) build still compiles.
+    #[cfg(feature = "remote")]
     #[test]
     fn remote_file_config_parses_full_section() {
         // H6c: the generic `providers:` map is the new shape.
