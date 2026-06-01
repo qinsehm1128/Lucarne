@@ -212,6 +212,9 @@ Default daemon builds (no `--features tui`) compile and link none of the TUI
 stack — no `ratatui`, no `crossterm`, no rmux binding — so the resident daemon
 stays a pure message bridge.
 
+See [`docs/tui.md`](docs/tui.md) for the full TUI guide (panels, keybindings,
+the daemon requirement for Go Public, and `term` → `lucarned tui` migration).
+
 ---
 
 ## Architecture Overview

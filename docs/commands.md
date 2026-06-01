@@ -62,6 +62,8 @@
 `lucarned tui` 是本地操作者的唯一交互入口（替代旧的 `term` CLI），需在 `tui`
 feature（隐含 `remote`）下构建：
 
+> 完整说明（面板、键位、Go Public 的守护进程依赖、`term` → `lucarned tui` 迁移）见 [`docs/tui.md`](tui.md)。
+
 ```bash
 cargo +nightly build --features tui
 lucarned tui
