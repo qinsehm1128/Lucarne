@@ -1,0 +1,40 @@
+[package]
+name = "lucarne-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Web chat bridge exposing a Lucarne AgentRuntime over WebSocket."
+rust-version.workspace = true
+repository.workspace = true
+
+# The "chat over web pipe" half of the dual-mode web converter: one `/chat`
+# WebSocket per browser tab drives a Lucarne `AgentRuntime` session (open /
+# submit / stream / resolve approvals). Peer in spirit to the Telegram/WeChat
+# channels, but the transport is the web ws — local (direct) and remote (via the
+# cloudflared tunnel) are identical to the client. Optional in lucarned via the
+# `remote` feature (it pulls axum, like lucarne-termgw).
+
+[dependencies]
+lucarne = { path = "../lucarne" }
+# Shared gateway limits + access scope + the ws-connection permit pool, so the
+# `/chat` ws is governed by the SAME GatewayLimits as termgw's `/ws` + `/agent`
+# (H1: connection cap, idle/lifetime close, inbound frame rate) and honors the
+# readonly access scope. termgw does NOT depend on lucarne-web, so this is acyclic.
+lucarne-termgw = { path = "../lucarne-termgw" }
+axum = { workspace = true, features = ["ws"] }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The combined dev runner (examples/webdev.rs) serves terminal + chat from one
+# port — the single converter. Examples may use dev-dependencies.
+lucarne-rmux = { path = "../lucarne-rmux" }
+lucarne-termgw = { path = "../lucarne-termgw" }
+lucarne-agentbind = { path = "../lucarne-agentbind" }
+# `test-util` enables `tokio::time` pause/advance so the open-ack timeout (M6)
+# and the FrameRate rate-limit window are unit-tested deterministically without
+# real sleeps (same pattern as the `lucarne` crate's runtime tests).
+tokio = { workspace = true, features = ["test-util"] }

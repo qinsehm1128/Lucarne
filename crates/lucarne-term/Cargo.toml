@@ -1,0 +1,21 @@
+[package]
+name = "lucarne-term"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rmux-free terminal vocabulary, snapshot differ and session registry."
+rust-version.workspace = true
+repository.workspace = true
+
+# rmux-free terminal vocabulary + snapshot differ + session registry. The pure
+# data core of the rmux terminal-monitor subsystem; the live rmux-sdk binding
+# lives in the sibling `lucarne-rmux` crate. NO rmux-* dependency (so the wire
+# types compile for the gateway / web channel / CLI without pulling the preview
+# SDK).
+
+[dependencies]
+serde = { workspace = true }
+bitflags = "2"
+
+[dev-dependencies]
+serde_json = { workspace = true }
