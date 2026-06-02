@@ -14,16 +14,17 @@ mirrored rmux sessions and the public-access tunnel.
 
 ## Build & launch
 
-The TUI is part of the default `lucarned` product build. Release users do not
-need to know about Cargo features: the shipped daemon binary includes the TUI,
-remote control plane, terminal gateway, and rmux live binding.
+The TUI is part of the explicit `lucarned` terminal product bundle
+(`product-terminal`). The default source build stays a minimal base daemon;
+release packaging enables the bundle so the shipped daemon binary includes the
+TUI, remote control plane, terminal gateway, and rmux live binding.
 
 ```bash
 # from a release build
 lucarned tui
 
 # from source (AGENTS.md build discipline: nightly + new build-dir layout)
-cargo +nightly run -Zbuild-dir-new-layout -p lucarned -- tui
+cargo +nightly run -Zbuild-dir-new-layout -p lucarned --features product-terminal -- tui
 ```
 
 ---
@@ -161,9 +162,10 @@ config and backup are created `0o600`. Secret fields are masked on screen.
   terminal content. The full interactive mirror lives in the web terminal view.
 - **Provider boundary (AGENTS.md).** Provider specifics stay behind
   `lucarne_remote` descriptors; the TUI/common layers route opaque ids only.
-- **Default product fusion.** `ratatui`/`crossterm`/`lucarne-termgw`/
-  `lucarne-rmux` are part of the default `lucarned` product build. `lucarne-rmux`
-  remains the isolated preview `rmux_sdk` boundary.
+- **Explicit capability features.** The source default build keeps
+  `ratatui`/`crossterm`/`lucarne-termgw`/`lucarne-rmux` out of the base daemon.
+  The `product-terminal` bundle opts into the terminal gateway, remote access,
+  TUI, and rmux stack for release packaging.
 
 See the decision record:
 [`docs/decisions/2026-06-01-lucarned-tui-frontend.md`](decisions/2026-06-01-lucarned-tui-frontend.md).

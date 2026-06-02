@@ -51,6 +51,9 @@ const FIELD_PUBLIC_URL: &str = "public_url";
 /// (SEC-003). When set it is used verbatim (after the same safety checks);
 /// otherwise the binary is resolved to an absolute path via `$PATH`.
 const FIELD_BINARY_PATH: &str = "binary_path";
+/// Deprecated `remote.cloudflare` config section accepted as a provider-owned
+/// compatibility alias for `remote.providers.cloudflared`.
+const COMPAT_SECTION_CLOUDFLARE: &str = "cloudflare";
 
 /// Bare binary name resolved on `$PATH` when no `binary_path` is configured.
 const CLOUDFLARED_BIN: &str = "cloudflared";
@@ -404,6 +407,10 @@ impl RemoteAccessProvider for Cloudflared {
 
     fn required_fields(&self) -> &[RequiredField] {
         REQUIRED_FIELDS
+    }
+
+    fn compat_config_sections(&self) -> &[&'static str] {
+        &[COMPAT_SECTION_CLOUDFLARE]
     }
 
     /// H6a: warn when running a *quick* tunnel (no `token`). A quick tunnel
@@ -867,6 +874,12 @@ mod tests {
     fn cloudflared_advertises_cf_connecting_ip_forwarded_header() {
         let provider = Cloudflared::new();
         assert_eq!(provider.forwarded_identity_headers(), &["cf-connecting-ip"]);
+    }
+
+    #[test]
+    fn cloudflared_declares_legacy_config_section_alias() {
+        let provider = Cloudflared::new();
+        assert_eq!(provider.compat_config_sections(), &["cloudflare"]);
     }
 
     #[test]

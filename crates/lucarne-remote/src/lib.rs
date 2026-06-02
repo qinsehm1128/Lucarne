@@ -205,6 +205,16 @@ pub trait RemoteAccessProvider: Send + Sync {
     /// Fields this provider needs, used to drive CLI prompting.
     fn required_fields(&self) -> &[RequiredField];
 
+    /// Deprecated provider-owned config section names accepted as compatibility
+    /// aliases for `remote.providers.<provider-id>`.
+    ///
+    /// The daemon treats these as opaque section names supplied by the provider
+    /// descriptor. Concrete alias names, field keys, and compatibility policy
+    /// stay at the provider boundary instead of becoming daemon/common schema.
+    fn compat_config_sections(&self) -> &[&'static str] {
+        &[]
+    }
+
     /// Operator-facing warnings about a given configuration (H6a).
     ///
     /// Lets a provider surface security/operational caveats about the config it

@@ -4,6 +4,7 @@
 //! JSON records under `~/.lucarne/term-archive/<archive_id>.json`.
 
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -53,7 +54,7 @@ pub fn save(
     archived_at: u64,
 ) -> std::io::Result<String> {
     let d = dir();
-    fs::create_dir_all(&d)?;
+    create_owner_only_dir(&d)?;
     let archive_id = format!("{}-{}", session_id.replace([':', '/'], "_"), archived_at);
     let record = ArchiveRecord {
         archive_id: archive_id.clone(),
@@ -63,11 +64,39 @@ pub fn save(
         archived_at,
         content: content.to_string(),
     };
-    fs::write(
-        d.join(format!("{archive_id}.json")),
-        serde_json::to_vec(&record)?,
+    write_owner_only_file(
+        &d.join(format!("{archive_id}.json")),
+        &serde_json::to_vec(&record)?,
     )?;
     Ok(archive_id)
+}
+
+fn create_owner_only_dir(path: &std::path::Path) -> std::io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn write_owner_only_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 /// List archived sessions (newest first, without content).
@@ -206,5 +235,21 @@ mod tests {
         assert_eq!(record.archive_id, archive_id);
         assert_eq!(record.content, "full scrollback");
         assert!(super::now_epoch() > 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_dir_and_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let sandbox = ArchiveSandbox::new();
+        let archive_id = super::save("pane", "pane", None, "secret scrollback", 9).unwrap();
+        let file = sandbox.path().join(format!("{archive_id}.json"));
+
+        let dir_mode = fs::metadata(sandbox.path()).unwrap().permissions().mode() & 0o777;
+        let file_mode = fs::metadata(file).unwrap().permissions().mode() & 0o777;
+
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
     }
 }

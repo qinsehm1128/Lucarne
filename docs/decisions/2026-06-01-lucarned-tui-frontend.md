@@ -29,13 +29,15 @@ pane mirroring stays a web-client concern).
 Add a single interactive entry, `lucarned tui`, as the only operator frontend,
 and remove the standalone `term` binary.
 
-### Single entry in the default `lucarned` product build
+### Single entry with explicit capability features
 
 `lucarned` gains a `tui` subcommand (wired through `lucarned-ctl`'s `Command`
 enum + `main` dispatch) that launches a full-screen `ratatui` dashboard. The TUI
-is part of the default `lucarned` product build together with the remote control
-plane, terminal gateway, and rmux live binding. Release users run `lucarned tui`
-directly; there is no separate source-build feature path for the TUI.
+is part of the explicit `product-terminal` bundle feature together with the
+remote control plane, terminal gateway, and rmux live binding. The default
+source build stays a minimal base daemon. Release packaging opts into
+`product-terminal`, so installed users run `lucarned tui` directly without a
+second binary.
 
 The dashboard has three panels, switched with `Tab` / `←` `→`:
 
@@ -105,28 +107,27 @@ unchanged.
 
 ## Rationale
 
-One binary matches what `cargo-dist` actually ships and removes the "which tool?"
-ambiguity. A full-screen dashboard is a better fit than a command CLI for the
-list-driven, interactive operator flows (browse sessions, watch tunnel status,
-scan a QR), and it can reuse the migrated, already-tested `term` logic without a
-rewrite. Direct fusion also prevents a release mismatch where installed users
-receive `lucarned` but the TUI/remote/rmux stack only exists in source builds.
-The control-plane-only posture keeps the new frontend a thin layer over stable
-APIs, honoring the no-new-IPC constraint.
+One binary in the release package matches what `cargo-dist` actually ships and
+removes the "which tool?" ambiguity. A full-screen dashboard is a better fit than
+a command CLI for the list-driven, interactive operator flows (browse sessions,
+watch tunnel status, scan a QR), and it can reuse the migrated, already-tested
+`term` logic without a rewrite. Explicit source features preserve architecture
+boundaries: the base daemon can be built and tested without pulling remote/rmux
+or TUI dependencies, while release packaging deliberately opts into the terminal
+product bundle. The control-plane-only posture keeps the frontend a thin layer
+over stable APIs, honoring the no-new-IPC constraint.
 
 ## Consequences
 
-- `lucarned` directly depends on `ratatui` 0.30 + `crossterm` 0.29, the migrated
-  `qrcode` helper, `lucarne-termgw`, `lucarne-rmux` (including archive
-  helpers), and `lucarne-remote`.
-- The default `lucarned` build is the product build: it includes TUI, gateway,
-  remote control, and rmux live binding.
+- `lucarned` exposes explicit capability features: `remote-access`,
+  `terminal-rmux`, `terminal-gateway`, `tui`, and the release-oriented
+  `product-terminal` bundle.
+- The default `lucarned` source build is the base daemon. The `product-terminal`
+  bundle includes TUI, gateway, remote control, and rmux live binding.
 - A durable fusion guard — `crates/lucarned/tests/default_build_fusion.rs` —
-  asserts (via `cargo tree -p lucarned` with no features) that the default build
-  includes `lucarne-termgw`, `lucarne-rmux`, `lucarne-remote`, `rmux-sdk`,
-  `ratatui`, and `crossterm`. It runs in every `cargo test` / `cargo test
-  --workspace`, so a future change that accidentally splits the product stack
-  back behind features fails CI/tests.
+  asserts (via `cargo tree -p lucarned`) that the default build excludes
+  `lucarne-termgw`, `lucarne-rmux`, `lucarne-remote`, `rmux-sdk`, `ratatui`, and
+  `crossterm`, while `--features product-terminal` includes them.
 - The standalone `term` binary, the `lucarne-termctl` crate, and the `term`-style
   command docs are removed; `README.md`, `README.cn.md`, and `docs/commands.md`
   now document `lucarned tui` and its keybindings.

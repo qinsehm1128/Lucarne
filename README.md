@@ -178,11 +178,14 @@ Telegram workspaces map to Forum Topics. One project gets one topic; one topic c
 
 ### Terminal monitor and the `lucarned tui` dashboard
 
-The terminal-monitor subsystem is part of `lucarned`. It mirrors the sessions on
-your system-wide rmux daemon to a web terminal view and lets a session be popped
-into your local terminal and retracted again while the remote mirror keeps
-running. External Web apps consume the same gateway API; Lucarne does not ship a
-separate internal web-chat runtime crate.
+The terminal-monitor subsystem is delivered through the `lucarned` product
+bundle feature (`product-terminal`). The default source build remains the base
+daemon; release packaging opts into the bundle so installed users still get the
+single `lucarned` entry. The terminal bundle mirrors sessions on your
+system-wide rmux daemon to a web terminal view and lets a session be popped into
+your local terminal and retracted again while the remote mirror keeps running.
+External Web apps consume the same gateway API; Lucarne does not ship a separate
+internal web-chat runtime crate.
 
 `lucarned tui` is the single interactive entry for the local operator. It is a
 full-screen, arrow-key-navigable dashboard and replaces the old standalone
@@ -190,6 +193,12 @@ full-screen, arrow-key-navigable dashboard and replaces the old standalone
 
 ```bash
 lucarned tui                             # launch the full-screen dashboard
+```
+
+From source, build or run this capability with an explicit feature:
+
+```bash
+cargo +nightly run -Zbuild-dir-new-layout -p lucarned --features product-terminal -- tui
 ```
 
 The dashboard has three panels (switch with `Tab` / `←` `→`, navigate items with

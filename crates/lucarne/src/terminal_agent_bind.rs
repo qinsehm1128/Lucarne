@@ -21,6 +21,8 @@ use tracing::{debug, warn};
 use crate::control_plane::{ControlPlaneSqliteStore, ControlPlaneStoreError, ProviderSessionId};
 
 const TERMINAL_AGENT_BINDING_KIND: &str = "terminal_agent_binding";
+const INITIAL_TRANSCRIPT_WINDOW_BYTES: u64 = 256 * 1024;
+const INCREMENTAL_TRANSCRIPT_READ_BYTES: u64 = 256 * 1024;
 
 /// The agent session a pane is bound to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,6 +133,11 @@ fn meta_cwd_matches(meta: &SessionMeta, cwd: &str) -> bool {
 /// Only complete newline-terminated lines are consumed; a partial trailing line
 /// is left for the next read. Provider schema parsing is delegated to the
 /// descriptor that owns the transcript.
+///
+/// `from == 0` is treated as an initial/history read and starts from a bounded
+/// tail window, not from byte zero. Terminal transcript files are provider-owned
+/// append-only logs and can grow indefinitely; terminal-adjacent views should
+/// bootstrap from a recent cursor window instead of scanning the full file.
 pub fn read_messages(path: &Path, from: u64) -> (Vec<Msg>, u64) {
     let Some((bytes, consumed)) = read_complete_lines_from(path, from) else {
         warn!(
@@ -179,19 +186,49 @@ fn read_complete_lines_from(path: &Path, from: u64) -> Option<(Vec<u8>, u64)> {
 
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    if len <= from {
+    if len <= from && from != 0 {
         return Some((Vec::new(), from));
     }
-    file.seek(SeekFrom::Start(from)).ok()?;
+    let start = read_start_for_cursor(&mut file, len, from)?;
+    if len <= start {
+        return Some((Vec::new(), start));
+    }
+    file.seek(SeekFrom::Start(start)).ok()?;
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf).ok()?;
+    let limit = if from == 0 {
+        INITIAL_TRANSCRIPT_WINDOW_BYTES
+    } else {
+        INCREMENTAL_TRANSCRIPT_READ_BYTES
+    };
+    file.take(limit).read_to_end(&mut buf).ok()?;
+
+    let mut consumed_start = start;
+    if from == 0 && start > 0 {
+        let Some(first_newline) = buf.iter().position(|byte| *byte == b'\n') else {
+            return Some((Vec::new(), start));
+        };
+        buf.drain(..=first_newline);
+        consumed_start += first_newline as u64 + 1;
+    }
 
     let consumed_len = match buf.iter().rposition(|byte| *byte == b'\n') {
         Some(last_newline) => last_newline + 1,
-        None => return Some((Vec::new(), from)),
+        None => return Some((Vec::new(), consumed_start)),
     };
     buf.truncate(consumed_len);
-    Some((buf, from + consumed_len as u64))
+    Some((buf, consumed_start + consumed_len as u64))
+}
+
+fn read_start_for_cursor(file: &mut std::fs::File, len: u64, from: u64) -> Option<u64> {
+    if from > 0 {
+        return Some(from.min(len));
+    }
+    if len <= INITIAL_TRANSCRIPT_WINDOW_BYTES {
+        return Some(0);
+    }
+    let start = len.saturating_sub(INITIAL_TRANSCRIPT_WINDOW_BYTES);
+    std::io::Seek::seek(file, std::io::SeekFrom::Start(start)).ok()?;
+    Some(start)
 }
 
 fn messages_from_session(provider: AgentProviderDescriptor, session: &Session) -> Vec<Msg> {
@@ -461,6 +498,27 @@ mod tests {
         assert_eq!(msgs2.len(), 1);
         assert_eq!(msgs2[0].text, "hi back");
         assert_eq!(off2, off + l2.len() as u64);
+    }
+
+    #[test]
+    fn initial_read_uses_bounded_tail_window() {
+        let mut f = tempfile::Builder::new()
+            .suffix(".jsonl")
+            .tempfile()
+            .unwrap();
+        writeln!(f, "{}", claude_session_line("/tmp/x", "sess-old")).unwrap();
+        let filler = "x".repeat((INITIAL_TRANSCRIPT_WINDOW_BYTES as usize) + 1024);
+        writeln!(f, "{filler}").unwrap();
+        writeln!(f, "{}", claude_session_line("/tmp/x", "sess-new")).unwrap();
+        f.flush().unwrap();
+
+        let (msgs, off) = read_messages(f.path(), 0);
+        assert!(off > INITIAL_TRANSCRIPT_WINDOW_BYTES);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(
+            msgs[0].text, "hello there",
+            "initial load should parse the recent complete transcript line"
+        );
     }
 
     #[test]

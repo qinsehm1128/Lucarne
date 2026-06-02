@@ -1,12 +1,13 @@
-//! Default-build fusion guard.
+//! Default-build capability-boundary guard.
 //!
-//! `lucarned` is the product entry. Remote access, terminal gateway wiring, the
-//! local TUI, and the live rmux binding must be present in the default build so
-//! release/install users do not need source-build feature flags.
+//! `lucarned` stays the single product entry, but terminal/rmux/remote/TUI
+//! capabilities are explicit source features. Release packaging may opt into a
+//! bundle; the default source build must keep the base daemon isolated from
+//! remote/rmux/TUI drift.
 
 use std::process::Command;
 
-const REQUIRED: &[&str] = &[
+const CAPABILITY_CRATES: &[&str] = &[
     "ratatui",
     "crossterm",
     "lucarne-rmux",
@@ -29,7 +30,7 @@ fn tree_crate_names(output: &str) -> Vec<String> {
 }
 
 #[test]
-fn default_lucarned_build_contains_terminal_gateway_tui_and_rmux_stack() {
+fn default_lucarned_build_keeps_terminal_gateway_tui_and_rmux_stack_out() {
     let output = Command::new("cargo")
         .args([
             "+nightly",
@@ -50,7 +51,46 @@ fn default_lucarned_build_contains_terminal_gateway_tui_and_rmux_stack() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let names = tree_crate_names(&stdout);
-    let missing: Vec<&str> = REQUIRED
+    let present: Vec<&str> = CAPABILITY_CRATES
+        .iter()
+        .copied()
+        .filter(|capability| names.iter().any(|name| name == capability))
+        .collect();
+
+    assert!(
+        present.is_empty(),
+        "default `lucarned` build must not link terminal/remote/TUI capability \
+         crates; found {:?}. Full tree:\n{}",
+        present,
+        stdout,
+    );
+}
+
+#[test]
+fn product_terminal_bundle_contains_terminal_gateway_tui_and_rmux_stack() {
+    let output = Command::new("cargo")
+        .args([
+            "+nightly",
+            "tree",
+            "-Zbuild-dir-new-layout",
+            "-p",
+            "lucarned",
+            "--features",
+            "product-terminal",
+        ])
+        .output()
+        .expect("failed to run `cargo +nightly tree -Zbuild-dir-new-layout -p lucarned --features product-terminal`");
+
+    assert!(
+        output.status.success(),
+        "cargo tree failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let names = tree_crate_names(&stdout);
+    let missing: Vec<&str> = CAPABILITY_CRATES
         .iter()
         .copied()
         .filter(|required| !names.iter().any(|name| name == required))
@@ -58,11 +98,36 @@ fn default_lucarned_build_contains_terminal_gateway_tui_and_rmux_stack() {
 
     assert!(
         missing.is_empty(),
-        "default `lucarned` build must include fused remote/TUI/rmux crates; \
-         missing {:?}. Full tree:\n{}",
+        "`product-terminal` bundle must include explicit terminal/remote/TUI \
+         capabilities; missing {:?}. Full tree:\n{}",
         missing,
         stdout,
     );
+}
+
+#[test]
+fn individual_capability_features_compile_without_accidental_coupling() {
+    for feature in ["remote-access", "terminal-rmux", "terminal-gateway", "tui"] {
+        let output = Command::new("cargo")
+            .args([
+                "+nightly",
+                "check",
+                "-Zbuild-dir-new-layout",
+                "-p",
+                "lucarned",
+                "--features",
+                feature,
+            ])
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run cargo check for {feature}: {err}"));
+
+        assert!(
+            output.status.success(),
+            "`lucarned` feature `{feature}` must compile independently:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
 }
 
 #[test]

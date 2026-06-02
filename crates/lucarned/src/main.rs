@@ -21,6 +21,7 @@ use lucarne_adapter::{
 use lucarne_telegram::telegram_plugin;
 use lucarne_wechat::wechat_plugin;
 use lucarned_ctl::updates::{UpdateNotice, UpdateRuntime, UpdateStateStore};
+#[cfg(feature = "terminal-gateway")]
 use remote_config::RemoteFileConfig;
 use serde::Deserialize;
 use tokio::sync::watch;
@@ -36,9 +37,13 @@ use tracing_subscriber::{
 
 mod health;
 mod onboarding;
+#[cfg(feature = "terminal-gateway")]
 mod remote;
+#[cfg(feature = "terminal-gateway")]
 mod remote_cli;
+#[cfg(feature = "terminal-gateway")]
 mod remote_config;
+#[cfg(feature = "tui")]
 mod tui;
 
 const DEFAULT_LOG_BUFFERED_LINES: usize = 1024;
@@ -163,14 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         lucarned_ctl::Command::Doctor | lucarned_ctl::Command::Update => {
             run_ctl_network_command(command).await
         }
-        lucarned_ctl::Command::Remote(command) => {
-            std::thread::spawn(move || remote_cli::run_remote_command(command))
-                .join()
-                .unwrap_or_else(|_| Err("remote command thread panicked".to_string()))
-                .map_err(|err| -> Box<dyn std::error::Error> {
-                    std::io::Error::new(std::io::ErrorKind::Other, err).into()
-                })
-        }
+        lucarned_ctl::Command::Remote(command) => run_remote_command(command),
         // The TUI is fully synchronous and uses `reqwest::blocking` for its
         // loopback control-plane calls. `reqwest::blocking` builds and drops its
         // own current-thread Tokio runtime; dropping a runtime inside this
@@ -179,15 +177,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // dedicated OS thread with no ambient runtime so the blocking client is
         // safe. The panic hook installed in `tui::run` is process-global, so a
         // panic on that thread still restores the terminal.
-        lucarned_ctl::Command::Tui => std::thread::spawn(tui::run)
-            .join()
-            .unwrap_or_else(|_| Err("tui thread panicked".to_string()))
-            .map_err(|err| -> Box<dyn std::error::Error> {
-                std::io::Error::new(std::io::ErrorKind::Other, err).into()
-            }),
+        lucarned_ctl::Command::Tui => run_tui_command(),
         command => lucarned_ctl::run(command)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err).into()),
     }
+}
+
+#[cfg(feature = "terminal-gateway")]
+fn run_remote_command(
+    command: lucarned_ctl::RemoteCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::thread::spawn(move || remote_cli::run_remote_command(command))
+        .join()
+        .unwrap_or_else(|_| Err("remote command thread panicked".to_string()))
+        .map_err(|err| -> Box<dyn std::error::Error> {
+            std::io::Error::new(std::io::ErrorKind::Other, err).into()
+        })
+}
+
+#[cfg(not(feature = "terminal-gateway"))]
+fn run_remote_command(
+    _command: lucarned_ctl::RemoteCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err("`lucarned remote` requires the `terminal-gateway` Cargo feature".into())
+}
+
+#[cfg(feature = "tui")]
+fn run_tui_command() -> Result<(), Box<dyn std::error::Error>> {
+    std::thread::spawn(tui::run)
+        .join()
+        .unwrap_or_else(|_| Err("tui thread panicked".to_string()))
+        .map_err(|err| -> Box<dyn std::error::Error> {
+            std::io::Error::new(std::io::ErrorKind::Other, err).into()
+        })
+}
+
+#[cfg(not(feature = "tui"))]
+fn run_tui_command() -> Result<(), Box<dyn std::error::Error>> {
+    Err("`lucarned tui` requires the `tui` Cargo feature".into())
 }
 
 async fn run_ctl_network_command(
@@ -226,11 +253,9 @@ async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
             ));
     lucarne::memory_profile_snapshot!("lucarned.main.after_register_adapters");
 
-    // H5 + cold-daemon lazy start: resolve the remote-access config BEFORE the
-    // idle-exit decision. `remote_config_from_config` always returns `Some` (the
-    // control plane is served from boot — lazy start), so `remote_enabled` is true
-    // and the daemon never idle-exits: the control plane must stay up for
-    // `lucarned remote start`.
+    // H5 + cold-daemon lazy start: when the terminal gateway product capability
+    // is built, resolve remote config before the idle-exit decision so the
+    // off-tunnel control plane can stay up for `lucarned remote start`.
     let remote_cfg = remote_config_from_config(&file_config)?;
     let remote_enabled = remote_cfg.is_some();
 
@@ -305,6 +330,7 @@ async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     // tunnel come up lazily on the first `lucarned remote start`, OR immediately
     // when `autostart` (`remote.enabled:true`) is set. Wired to the daemon
     // shutdown signal so a running tunnel is torn down gracefully.
+    #[cfg(feature = "terminal-gateway")]
     if let Some(remote_cfg) = remote_cfg {
         match remote::spawn_remote_subsystem(
             remote_cfg,
@@ -328,6 +354,8 @@ async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    #[cfg(not(feature = "terminal-gateway"))]
+    let _ = remote_cfg;
 
     info!(
         adapters = adapter_status_reader.snapshot().len(),
@@ -504,6 +532,7 @@ struct LucarnedFileConfig {
     logging: LoggingFileConfig,
     #[serde(default)]
     health: HealthFileConfig,
+    #[cfg(feature = "terminal-gateway")]
     #[serde(default)]
     remote: RemoteFileConfig,
     #[serde(default)]
@@ -768,14 +797,26 @@ fn health_addr_from_config(
         .map_err(Into::into)
 }
 
+#[cfg(feature = "terminal-gateway")]
 fn remote_config_from_config(
     config: &LucarnedFileConfig,
 ) -> Result<Option<remote::RemoteRuntimeConfig>, Box<dyn std::error::Error>> {
     remote_config::remote_config_from_config(&config.remote)
 }
 
+#[cfg(not(feature = "terminal-gateway"))]
+fn remote_config_from_config(
+    _config: &LucarnedFileConfig,
+) -> Result<Option<()>, Box<dyn std::error::Error>> {
+    Ok(None)
+}
+
 fn parse_bool(value: &str) -> Option<bool> {
-    remote_config::parse_bool(value)
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 fn log_filter_spec(config: &LucarnedFileConfig) -> String {
@@ -1248,7 +1289,8 @@ mod tests {
             .collect::<String>();
 
         assert!(
-            compact_source.contains("Command::Tui=>std::thread::spawn(tui::run)"),
+            compact_source.contains("Command::Tui=>run_tui_command()")
+                && compact_source.contains("fnrun_tui_command()->Result<(),Box<dynstd::error::Error>>{std::thread::spawn(tui::run)"),
             "the `Command::Tui` arm must run `tui::run` on a dedicated thread, \
              not inside the tokio runtime"
         );
@@ -1811,6 +1853,7 @@ health:
         );
     }
 
+    #[cfg(feature = "terminal-gateway")]
     #[test]
     fn default_config_parses_including_remote_providers() {
         // Regression guard: the bootstrapped default config (which writes
@@ -1837,6 +1880,7 @@ health:
         );
     }
 
+    #[cfg(feature = "terminal-gateway")]
     #[test]
     fn remote_file_config_parses_full_section() {
         // H6c: the generic `providers:` map is the new shape.
@@ -1897,7 +1941,8 @@ remote:
             Some("https://tunnel.example.com")
         );
 
-        // Back-compat: the legacy `cloudflare:` block still parses (H6c).
+        // Back-compat: the legacy provider-owned `cloudflare:` compat section
+        // still parses without daemon-owned concrete provider structs (H6c).
         let legacy = LucarnedFileConfig::from_yaml_str(
             r#"
 remote:
@@ -1909,11 +1954,21 @@ remote:
         )
         .expect("parse legacy remote config");
         assert_eq!(
-            legacy.remote.cloudflare.token.as_deref(),
+            legacy
+                .remote
+                .extra_sections
+                .get("cloudflare")
+                .and_then(|section| section.get("token"))
+                .and_then(serde_json::Value::as_str),
             Some("legacy-token")
         );
         assert_eq!(
-            legacy.remote.cloudflare.public_url.as_deref(),
+            legacy
+                .remote
+                .extra_sections
+                .get("cloudflare")
+                .and_then(|section| section.get("public_url"))
+                .and_then(serde_json::Value::as_str),
             Some("https://legacy.example.com")
         );
 
@@ -1924,12 +1979,13 @@ remote:
         assert_eq!(missing.remote.provider, None);
         assert_eq!(missing.remote.control_addr, None);
         assert!(missing.remote.providers.is_empty());
-        assert_eq!(missing.remote.cloudflare.token, None);
+        assert!(!missing.remote.extra_sections.contains_key("cloudflare"));
     }
 
-    // H6c: the generic provider_fields map is resolved with the legacy
-    // `cloudflare:` block as a back-compat base and `providers.<id>` merged over
-    // it. The daemon never interprets a field name.
+    // H6c: the generic provider_fields map is resolved with provider-declared
+    // compat sections merged first and `providers.<id>` merged over them. The
+    // daemon never interprets a provider-specific field name.
+    #[cfg(feature = "terminal-gateway")]
     #[test]
     fn remote_config_resolves_generic_provider_fields() {
         with_env(
@@ -2058,6 +2114,7 @@ remote:
             },
         );
     }
+    #[cfg(feature = "terminal-gateway")]
     #[test]
     fn remote_config_requires_enabled_gate_and_honors_env() {
         // Cold-daemon lazy start: lucarned ALWAYS resolves to `Some` (the
@@ -2163,6 +2220,7 @@ remote:
 
     // SEC-002: a control_addr sharing the gateway port is rejected (it would
     // re-expose the control plane on the tunnel).
+    #[cfg(feature = "terminal-gateway")]
     #[test]
     fn remote_config_rejects_control_addr_sharing_gateway_port() {
         with_env(
@@ -2192,6 +2250,7 @@ remote:
 
     // SEC-008: a weak explicit auth_token (whitespace / too short) fails closed
     // at config resolution.
+    #[cfg(feature = "terminal-gateway")]
     #[test]
     fn remote_config_rejects_weak_auth_token() {
         with_env(
@@ -2237,6 +2296,7 @@ remote:
 
     // SEC-013: a read-only token is resolved when set and validated like the
     // full token (weak ⇒ rejected). Absent ⇒ no read-only tier.
+    #[cfg(feature = "terminal-gateway")]
     #[test]
     fn remote_config_resolves_and_validates_readonly_token() {
         with_env(
@@ -2296,6 +2356,7 @@ remote:
             },
         );
     }
+    #[cfg(feature = "terminal-gateway")]
     #[test]
     fn remote_config_rejects_non_loopback_gateway_addr() {
         with_env(
@@ -2435,10 +2496,11 @@ logging:
         assert!(idle_exit < http_client);
     }
 
-    // H5 + cold-daemon lazy start: the remote config is resolved BEFORE the
-    // idle-exit decision and ALWAYS resolves to `Some` (the
-    // control plane is served from boot — lazy start) so `remote_enabled` is true
-    // and the daemon does NOT idle-exit.
+    // H5 + cold-daemon lazy start: when the terminal gateway product capability
+    // is built, remote config is resolved BEFORE the idle-exit decision and
+    // resolves to `Some` so the control plane is served from boot and the daemon
+    // does NOT idle-exit.
+    #[cfg(feature = "terminal-gateway")]
     #[test]
     fn remote_only_config_keeps_daemon_from_idle_exit() {
         // Source-level: remote_cfg is resolved before the idle-exit guidance log.

@@ -1,16 +1,17 @@
 //! Remote-access subsystem wiring for `lucarned`.
 //!
-//! Owns the public-tunnel lifecycle inside the daemon (Locked decision L6): the
-//! daemon binds the terminal gateway to **loopback** (Locked decision L3),
-//! enforces **default-deny** auth (Locked decision L4 — a token is required;
-//! absent → generated at startup; `insecure` is the explicit, loud opt-out), and
-//! starts the selected tunnel provider from [`lucarne_remote::builtin`]. The
-//! tunnel survives the CLI exiting and is torn down when the daemon shuts down.
+//! Owns the public-tunnel lifecycle inside the daemon (Locked decision L6).
+//! Remote access is a middle layer: it exposes a selected local capability on a
+//! loopback listener, then asks the selected tunnel provider from
+//! [`lucarne_remote::builtin`] to publish that listener. The current product
+//! bundle exposes the terminal gateway capability, but the tunnel provider and
+//! exposure manager do not own rmux semantics.
 //!
 //! The CLI drives this over the loopback-only `/api/remote/{start,stop,status}`
-//! routes which the gateway forwards to [`DaemonRemoteControl`] (the daemon's
-//! [`lucarne_termgw::RemoteControl`] implementation). Mirrors the health
-//! subsystem's spawn-after-gateway + shutdown wiring (`main.rs`).
+//! routes on a dedicated off-tunnel control listener. Those routes call
+//! [`RemoteExposureManager`] (the daemon's [`lucarne_termgw::RemoteControl`]
+//! implementation) without exposing the control plane through the public
+//! terminal gateway.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -31,6 +32,15 @@ use tracing::{info, warn};
 #[async_trait]
 trait GatewayStarter: Send + Sync {
     async fn start_gateway(&self) -> Result<(), RemoteControlError>;
+}
+
+/// Local capability selected for remote exposure.
+///
+/// This keeps RemoteAccess as a tunnel/admission layer. The terminal gateway is
+/// one capability that can be published, not the definition of remote access.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExposedCapability {
+    TerminalGateway,
 }
 
 /// Web asset directory served by the gateway for local/static clients. Env
@@ -75,6 +85,8 @@ pub struct RemoteRuntimeConfig {
     /// [`ProviderConfig`] without interpreting any field — provider-specific
     /// structure stays at the provider boundary.
     pub provider_fields: std::collections::BTreeMap<String, String>,
+    /// Capability published through the remote-access tunnel.
+    pub capability: ExposedCapability,
     /// Cold-daemon lazy start (this change): when `true` the daemon auto-starts
     /// the configured tunnel at boot (the historical `remote.enabled:true`
     /// behaviour — gateway + monitor + tunnel come up immediately). When `false`
@@ -118,7 +130,7 @@ impl RemoteRuntimeConfig {
 
 /// Handle returned to `run_daemon` after the subsystem is up — carries the
 /// fields the daemon logs (`provider`, `public_url`). The live tunnel + control
-/// plane live in the spawned tasks / the `Arc<DaemonRemoteControl>`.
+/// plane live in the spawned tasks / the `Arc<RemoteExposureManager>`.
 ///
 /// `public_url` is `Some` only when the tunnel was actually started (autostart),
 /// and `None` when the control plane is up but the tunnel is still idle (cold
@@ -138,7 +150,7 @@ pub struct RemoteSubsystem {
 /// data needed for the await; the long-running provider await then runs lock-free
 /// (so status/stop/start never block each other and shutdown can't deadlock),
 /// and the result is written back under a fresh lock.
-struct DaemonRemoteControl {
+struct RemoteExposureManager {
     registry: RemoteRegistry,
     config: RemoteRuntimeConfig,
     /// The gateway access token handed to remote clients (`#token=…`). Present
@@ -147,21 +159,17 @@ struct DaemonRemoteControl {
     /// Tunnel lifecycle state machine (H4). Guards transitions; provider awaits
     /// happen with this lock released.
     state: Mutex<TunnelState>,
-    /// Cold-daemon lazy gateway (this change): the gateway (rmux monitor + termgw
-    /// router + merged chat + bind/serve) is NOT brought up at boot when
-    /// `autostart` is false. The auth state + shared ws pool + web asset dir are
-    /// built once at startup (so the control plane can return a token from boot)
-    /// and held here so the FIRST `start()` can lazily connect rmux + bind the
-    /// gateway. `ensure_gateway` runs that wiring at most once (`gateway_up`).
+    /// Auth/admission state for the selected exposed capability. For the current
+    /// terminal capability this feeds the termgw router.
     auth: AuthState,
     ws_pool: WsConnectionPool,
     control_store: ControlPlaneSqliteStore,
     web_dir: PathBuf,
-    /// Once-guard for the lazy gateway bring-up. `false` until `ensure_gateway`
-    /// has connected rmux + bound + spawned the gateway serve task; then `true`.
-    /// H4 discipline: the heavy work (rmux connect / bind / serve) runs with this
-    /// lock RELEASED; the lock is only held to read/set the flag.
-    gateway_up: Mutex<bool>,
+    /// Once-guard for the lazy capability bring-up. For `TerminalGateway`, this
+    /// means rmux connect + termgw bind/serve. Future capabilities should add
+    /// their own branch in `ensure_capability_ready` instead of pushing tunnel
+    /// logic into rmux.
+    capability_up: Mutex<bool>,
     #[cfg(test)]
     gateway_starter: Option<Arc<dyn GatewayStarter>>,
 }
@@ -180,7 +188,7 @@ enum TunnelState {
     Stopping,
 }
 
-impl DaemonRemoteControl {
+impl RemoteExposureManager {
     fn status_from(&self, handle: Option<&TunnelHandle>) -> RemoteControlStatus {
         match handle {
             Some(h) => RemoteControlStatus {
@@ -200,7 +208,7 @@ impl DaemonRemoteControl {
 }
 
 #[async_trait]
-impl RemoteControl for DaemonRemoteControl {
+impl RemoteControl for RemoteExposureManager {
     /// H4: the `self.state` lock is NEVER held across an `await`. The
     /// already-running idempotent path clones the [`TunnelHandle`] out under the
     /// lock (phase 1a), probes `provider.health(&handle)` with the lock RELEASED
@@ -411,7 +419,7 @@ impl RemoteControl for DaemonRemoteControl {
     }
 }
 
-impl DaemonRemoteControl {
+impl RemoteExposureManager {
     /// Lazily bring up the gateway exactly once (cold-daemon lazy start).
     ///
     /// On a cold daemon (`autostart:false`) the control plane is served from boot
@@ -420,7 +428,7 @@ impl DaemonRemoteControl {
     /// monitor, builds the termgw router on the shared ws pool, binds the
     /// loopback gateway, and spawns its serve task.
     ///
-    /// H4 discipline: the `gateway_up` lock is NEVER held across the heavy awaits
+    /// H4 discipline: the `capability_up` lock is NEVER held across the heavy awaits
     /// (rmux connect / bind / serve). Phase 1 reads the flag under the lock and
     /// returns early if already up; phase 2 does the work lock-free; phase 3
     /// re-acquires the lock, re-checks the flag (a concurrent caller may have
@@ -431,16 +439,22 @@ impl DaemonRemoteControl {
     /// An rmux connect / bind failure returns [`RemoteControlError::Backend`] so
     /// the CLI gets a clear error WITHOUT crashing the daemon (the control plane
     /// stays up; a later `lucarned remote start` can retry once rmux is available).
-    async fn ensure_gateway(&self) -> Result<(), RemoteControlError> {
+    async fn ensure_capability_ready(&self) -> Result<(), RemoteControlError> {
+        match self.config.capability {
+            ExposedCapability::TerminalGateway => self.ensure_terminal_gateway().await,
+        }
+    }
+
+    async fn ensure_terminal_gateway(&self) -> Result<(), RemoteControlError> {
         // Phase 1 (locked): already up → nothing to do.
-        if *self.gateway_up.lock().await {
+        if *self.capability_up.lock().await {
             return Ok(());
         }
 
         #[cfg(test)]
         if let Some(starter) = &self.gateway_starter {
             starter.start_gateway().await?;
-            let mut guard = self.gateway_up.lock().await;
+            let mut guard = self.capability_up.lock().await;
             if !*guard {
                 *guard = true;
             }
@@ -448,7 +462,7 @@ impl DaemonRemoteControl {
         }
 
         // Phase 2 (lock-free): connect rmux, build + bind the gateway. None of
-        // these awaits hold the `gateway_up` lock (H4).
+        // these awaits hold the `capability_up` lock (H4).
         let monitor = Arc::new(
             RmuxMonitor::connect()
                 .await
@@ -490,7 +504,7 @@ impl DaemonRemoteControl {
         // the race while we were connecting/binding lock-free. If so, discard this
         // duplicate listener (drop it) so we never double-serve the same port.
         {
-            let mut guard = self.gateway_up.lock().await;
+            let mut guard = self.capability_up.lock().await;
             if *guard {
                 drop(listener);
                 return Ok(());
@@ -517,11 +531,11 @@ impl DaemonRemoteControl {
         &self,
         params: RemoteStartParams,
     ) -> Result<TunnelHandle, RemoteControlError> {
-        // Cold-daemon lazy start: bring up the gateway (rmux monitor + termgw
-        // router + bind) on demand BEFORE the tunnel targets it. Idempotent +
-        // once-guarded; an rmux/bind failure is a typed Backend error (the daemon
-        // does not crash; the control plane stays up for a retry).
-        self.ensure_gateway().await?;
+        // Cold-daemon lazy start: bring up the selected exposed capability on a
+        // loopback listener before the tunnel targets it. For TerminalGateway,
+        // this means rmux monitor + termgw router + bind. The tunnel layer
+        // itself remains capability-agnostic.
+        self.ensure_capability_ready().await?;
 
         // G3: a CLI-supplied provider id overrides the daemon's configured one;
         // absent → fall back to the pre-configured provider.
@@ -677,22 +691,22 @@ pub async fn spawn_remote_subsystem(
     // H1: ONE shared ws-connection pool drives every ws route on the gateway port
     // (`/ws` + `/agent`) so a single `max_ws_connections` cap (plus the same
     // idle/lifetime/inbound-frame-rate limits) governs all of them. Built here
-    // so it is shared by the lazy gateway bring-up (`ensure_gateway`).
+    // so it is shared by the lazy capability bring-up.
     let ws_pool = WsConnectionPool::new(GatewayLimits::default());
 
-    // Web asset dir served by the gateway (resolved here so `ensure_gateway` does
-    // not re-read the env per start).
+    // Web asset dir served by the terminal gateway (resolved here so capability
+    // bring-up does not re-read the env per start).
     let web_dir = std::path::PathBuf::from(
         std::env::var("LUCARNED_REMOTE_WEB").unwrap_or_else(|_| DEFAULT_WEB_DIR.to_string()),
     );
     let control_addr = config.control_addr;
 
-    // The daemon owns the tunnel lifecycle; a SEPARATE loopback control listener
-    // (SEC-002) forwards `/api/remote/*` to it. H4: the control starts in the
-    // Idle state; its state machine runs provider awaits lock-free. The gateway
-    // (rmux monitor + termgw router + bind) is NOT connected here — it is brought
-    // up lazily on the first `start()` (cold-daemon lazy start).
-    let control = Arc::new(DaemonRemoteControl {
+    // The daemon owns the exposure lifecycle; a SEPARATE loopback control
+    // listener (SEC-002) forwards `/api/remote/*` to it. H4: the control starts
+    // in the Idle state; its state machine runs provider awaits lock-free. The
+    // selected capability is NOT connected here — it is brought up lazily on the
+    // first `start()` (cold-daemon lazy start).
+    let control = Arc::new(RemoteExposureManager {
         registry,
         config: config.clone(),
         access_token: access_token.clone(),
@@ -701,7 +715,7 @@ pub async fn spawn_remote_subsystem(
         ws_pool,
         control_store,
         web_dir,
-        gateway_up: Mutex::new(false),
+        capability_up: Mutex::new(false),
         #[cfg(test)]
         gateway_starter: None,
     });
@@ -731,8 +745,8 @@ pub async fn spawn_remote_subsystem(
 
     // Autostart (historical `remote.enabled:true` behaviour): bring up the
     // gateway + tunnel immediately via one `start()` (the SAME lazy path
-    // `lucarned remote start` uses — `ensure_gateway` then `provider.start`). When
-    // `autostart` is false the control plane is ready and the tunnel stays idle
+    // `lucarned remote start` uses — capability readiness then `provider.start`).
+    // When `autostart` is false the control plane is ready and the tunnel stays idle
     // until the first `lucarned remote start`. The daemon's auto-start uses its
     // pre-configured provider + fields (empty params — the G3 override path is the
     // CLI's `/api/remote/start` body).
@@ -837,6 +851,7 @@ mod tests {
             readonly_token: None,
             insecure: false,
             provider_fields: BTreeMap::new(),
+            capability: ExposedCapability::TerminalGateway,
             autostart: false,
         }
     }
@@ -848,10 +863,10 @@ mod tests {
             .collect()
     }
 
-    /// Build a `DaemonRemoteControl` for the pure-logic tests (no tunnel/rmux):
+    /// Build a `RemoteExposureManager` for the pure-logic tests (no tunnel/rmux):
     /// it sits in `Idle` with no gateway up, so `status`/`stop`/`status_from` can
     /// be exercised without ever connecting rmux or binding a port.
-    fn control(config: RemoteRuntimeConfig, access_token: Option<String>) -> DaemonRemoteControl {
+    fn control(config: RemoteRuntimeConfig, access_token: Option<String>) -> RemoteExposureManager {
         control_with_registry(config, access_token, lucarne_remote::builtin(), None)
     }
 
@@ -860,8 +875,8 @@ mod tests {
         access_token: Option<String>,
         registry: lucarne_remote::RemoteRegistry,
         gateway_starter: Option<Arc<dyn GatewayStarter>>,
-    ) -> DaemonRemoteControl {
-        DaemonRemoteControl {
+    ) -> RemoteExposureManager {
+        RemoteExposureManager {
             registry,
             config,
             access_token,
@@ -871,7 +886,7 @@ mod tests {
             control_store: ControlPlaneSqliteStore::open_in_memory()
                 .expect("open in-memory control-plane store"),
             web_dir: PathBuf::from("web"),
-            gateway_up: Mutex::new(false),
+            capability_up: Mutex::new(false),
             gateway_starter,
         }
     }
@@ -1001,7 +1016,7 @@ mod tests {
     fn fake_control(
         provider: FakeProvider,
         gateway: Arc<CountingGatewayStarter>,
-    ) -> DaemonRemoteControl {
+    ) -> RemoteExposureManager {
         let mut config = base_config();
         config.provider = "fake".to_string();
         let mut registry = lucarne_remote::RemoteRegistry::new();
@@ -1140,7 +1155,7 @@ mod tests {
         assert!(matches!(io, RemoteControlError::Backend(_)));
     }
 
-    // ---- DaemonRemoteControl::status_from: running / idle, token passthrough ----
+    // ---- RemoteExposureManager::status_from: running / idle, token passthrough ----
 
     #[test]
     fn status_from_running_handle_reports_provider_and_url() {
@@ -1209,9 +1224,10 @@ mod tests {
 
     #[tokio::test]
     async fn second_start_is_rejected_while_starting() {
-        // Provider-lookup / validate sit behind `ensure_gateway` (which connects
-        // rmux), so the reachable rmux-free state-machine guard is the busy-state
-        // rejection: a control already in `Starting` rejects a concurrent start.
+        // Provider-lookup / validate sit behind capability readiness (which
+        // connects rmux for TerminalGateway), so the reachable rmux-free
+        // state-machine guard is the busy-state rejection: a control already in
+        // `Starting` rejects a concurrent start.
         let ctl = control(base_config(), Some(VALID_TOKEN.to_string()));
         *ctl.state.lock().await = TunnelState::Starting;
         let err = ctl

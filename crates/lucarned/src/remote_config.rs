@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 use serde::Deserialize;
+use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::remote;
@@ -39,33 +40,11 @@ pub(crate) struct RemoteFileConfig {
     pub insecure: Option<bool>,
     #[serde(default)]
     pub providers: BTreeMap<String, BTreeMap<String, Option<String>>>,
-    /// Deprecated back-compat alias for `providers.cloudflared`.
-    #[serde(default)]
-    pub cloudflare: CloudflareFileConfig,
-}
-
-/// Deprecated cloudflare-specific sub-map. New configs should use
-/// `remote.providers.cloudflared`.
-#[derive(Clone, Debug, Default, Deserialize)]
-pub(crate) struct CloudflareFileConfig {
-    pub token: Option<String>,
-    pub public_url: Option<String>,
-    pub binary_path: Option<String>,
-}
-
-impl CloudflareFileConfig {
-    fn as_field_entries(&self) -> Vec<(String, String)> {
-        let mut out = Vec::new();
-        let mut push = |key: &str, value: &Option<String>| {
-            if let Some(v) = value.as_deref().filter(|v| !v.is_empty()) {
-                out.push((key.to_string(), v.to_string()));
-            }
-        };
-        push("token", &self.token);
-        push("public_url", &self.public_url);
-        push("binary_path", &self.binary_path);
-        out
-    }
+    /// Opaque extra YAML sections. Provider-owned compatibility aliases are
+    /// discovered through [`lucarne_remote::RemoteAccessProvider`] descriptors.
+    /// Daemon/common config must not own concrete provider-specific structs.
+    #[serde(default, flatten)]
+    pub extra_sections: BTreeMap<String, Value>,
 }
 
 /// Environment read seam so tests and future callers can resolve config without
@@ -113,7 +92,7 @@ pub(crate) fn remote_config_from_config_with_env<E: RemoteConfigEnv>(
     let gateway_addr_raw = env
         .var("LUCARNED_REMOTE_GATEWAY_ADDR")
         .or_else(|| remote.gateway_addr.clone())
-        .unwrap_or_else(|| DEFAULT_REMOTE_GATEWAY_ADDR.to_string());
+        .unwrap_or_else(default_remote_gateway_addr);
     let gateway_addr = lucarne_termgw::parse_gateway_addr(&gateway_addr_raw)?;
 
     let control_addr_raw = env
@@ -169,6 +148,7 @@ pub(crate) fn remote_config_from_config_with_env<E: RemoteConfigEnv>(
         readonly_token,
         insecure,
         provider_fields,
+        capability: remote::ExposedCapability::TerminalGateway,
         autostart,
     }))
 }
@@ -178,7 +158,7 @@ fn derive_control_addr(
     gateway_addr: SocketAddr,
 ) -> Result<String, Box<dyn std::error::Error>> {
     if gateway_addr_raw == DEFAULT_REMOTE_GATEWAY_ADDR {
-        return Ok(DEFAULT_REMOTE_CONTROL_ADDR.to_string());
+        return Ok(default_remote_control_addr());
     }
     match gateway_addr.port().checked_add(1) {
         Some(port) => Ok(SocketAddr::new(gateway_addr.ip(), port).to_string()),
@@ -189,6 +169,18 @@ fn derive_control_addr(
         )
         .into()),
     }
+}
+
+fn default_remote_gateway_addr() -> String {
+    format!("127.0.0.1:{DEFAULT_REMOTE_GATEWAY_PORT}")
+}
+
+fn default_remote_control_addr() -> String {
+    debug_assert_eq!(
+        DEFAULT_REMOTE_CONTROL_ADDR,
+        format!("127.0.0.1:{DEFAULT_REMOTE_CONTROL_PORT}")
+    );
+    DEFAULT_REMOTE_CONTROL_ADDR.to_string()
 }
 
 fn ensure_control_plane_off_tunnel(
@@ -223,16 +215,18 @@ fn validate_tokens(
 
 /// Assemble the generic provider field map for `provider` (H6c).
 ///
-/// Precedence: deprecated `remote.cloudflare` base for cloudflared, then
-/// `remote.providers.<provider>` over it. Empty/null values are absent.
+/// Precedence: provider-declared compatibility sections first, then
+/// `remote.providers.<provider>` over them. Empty/null values are absent.
 pub(crate) fn resolve_provider_fields(
     remote: &RemoteFileConfig,
     provider: &str,
 ) -> BTreeMap<String, String> {
     let mut fields = BTreeMap::new();
-    if provider == DEFAULT_REMOTE_PROVIDER {
-        for (key, value) in remote.cloudflare.as_field_entries() {
-            fields.insert(key, value);
+    if let Some(provider_descriptor) = lucarne_remote::builtin().lookup(provider) {
+        for section in provider_descriptor.compat_config_sections() {
+            if let Some(section_fields) = remote.extra_sections.get(*section) {
+                merge_provider_section(&mut fields, section_fields);
+            }
         }
     }
     if let Some(map) = remote.providers.get(provider) {
@@ -243,6 +237,20 @@ pub(crate) fn resolve_provider_fields(
         }
     }
     fields
+}
+
+fn merge_provider_section(fields: &mut BTreeMap<String, String>, section: &Value) {
+    let Some(map) = section.as_object() else {
+        return;
+    };
+    for (key, value) in map {
+        match value {
+            Value::String(value) if !value.is_empty() => {
+                fields.insert(key.clone(), value.clone());
+            }
+            _ => {}
+        }
+    }
 }
 
 pub(crate) fn parse_bool(value: &str) -> Option<bool> {

@@ -178,15 +178,23 @@ Telegram workspace 映射为 Forum Topic。一个项目一个 topic；一个 top
 
 ### 终端监控与 `lucarned tui` 控制台
 
-终端监控子系统已经直接融合进 `lucarned`。它把系统级 rmux daemon 上的会话镜像到
-web 终端视图，并允许把某个会话弹出到本地终端、再收回，而远程镜像保持运行。外部
-Web app 直接消费同一套 gateway API；Lucarne 内部不再维护独立 web-chat runtime crate。
+终端监控子系统通过 `lucarned` 的产品 bundle feature（`product-terminal`）交付。
+默认源码构建仍保持 base daemon；release packaging 会显式启用 bundle，所以安装用户仍然
+只有一个 `lucarned` 入口。终端 bundle 会把系统级 rmux daemon 上的会话镜像到 web
+终端视图，并允许把某个会话弹出到本地终端、再收回，而远程镜像保持运行。外部 Web app
+直接消费同一套 gateway API；Lucarne 内部不再维护独立 web-chat runtime crate。
 
 `lucarned tui` 是本地操作者的唯一交互入口：一个全屏、方向键导航的控制台，替代了
 旧的独立 `term` CLI。启动：
 
 ```bash
 lucarned tui                             # 启动全屏控制台
+```
+
+源码构建/运行这个能力时需要显式 feature：
+
+```bash
+cargo +nightly run -Zbuild-dir-new-layout -p lucarned --features product-terminal -- tui
 ```
 
 控制台有三个面板（`Tab` / `←` `→` 切换面板，`↑` `↓` 移动选项，`q` / `Esc` 退出）：
