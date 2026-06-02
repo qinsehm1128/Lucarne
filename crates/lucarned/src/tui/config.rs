@@ -19,19 +19,12 @@ use ratatui::widgets::ListState;
 
 use lucarne_remote::ProviderConfig;
 
-/// Default gateway loopback port (mirrors the daemon `DEFAULT_REMOTE_GATEWAY_ADDR`
-/// = `127.0.0.1:7800`). Used only to seed an empty form; the real value comes from
-/// the parsed `lucarned.yaml` when present. Reuses the go-public default so the
-/// gateway-port default lives in one place.
-const DEFAULT_GATEWAY_PORT: u16 = super::remote::DEFAULT_GATEWAY_PORT;
-/// Default control loopback port (= gateway + 1 = `7801`). Derived from the
-/// gateway default via the shared [`super::remote::default_control_port`] so the
-/// `+1` relationship is the single source of truth (MNT-004); falls back to a
-/// literal only in the impossible overflow case (the default gateway is 7800).
-const DEFAULT_CONTROL_PORT: u16 = match super::remote::default_control_port(DEFAULT_GATEWAY_PORT) {
-    Some(port) => port,
-    None => 7801,
-};
+use crate::remote_config;
+
+/// Default gateway/control ports come from the daemon's typed remote config
+/// service, not duplicated literals in the TUI.
+const DEFAULT_GATEWAY_PORT: u16 = remote_config::DEFAULT_REMOTE_GATEWAY_PORT;
+const DEFAULT_CONTROL_PORT: u16 = remote_config::DEFAULT_REMOTE_CONTROL_PORT;
 
 // ---- Config panel (TASK-004): descriptor-driven form + YAML write-back ----
 
@@ -252,24 +245,26 @@ impl ConfigPanel {
         let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(raw) else {
             return;
         };
-        let remote = mapping_get(&value, "remote");
-        if let Some(provider) = remote
-            .and_then(|r| mapping_get(r, "provider"))
-            .and_then(serde_yaml::Value::as_str)
-        {
+        #[derive(serde::Deserialize)]
+        struct RemoteSeed {
+            #[serde(default)]
+            remote: remote_config::RemoteFileConfig,
+        }
+        if let Ok(parsed) = serde_yaml::from_str::<RemoteSeed>(raw).map(|seed| seed.remote) {
             // Only adopt a provider we actually know about (opaque routing); an
             // unknown id keeps the default selection.
-            if let Some(idx) = self.providers.iter().position(|p| *p == provider) {
-                self.provider_index = idx;
-                self.edits.provider = provider.to_string();
+            if let Some(provider) = parsed.provider.as_deref() {
+                if let Some(idx) = self.providers.iter().position(|p| *p == provider) {
+                    self.provider_index = idx;
+                    self.edits.provider = provider.to_string();
+                }
             }
+            self.edits.enabled = parsed.enabled.unwrap_or(self.edits.enabled);
+            self.edits.auth_token = parsed.auth_token.filter(|v| !v.is_empty());
+            self.edits.readonly_token = parsed.readonly_token.filter(|v| !v.is_empty());
+            self.edits.insecure = parsed.insecure.unwrap_or(false);
         }
-        if let Some(enabled) = remote
-            .and_then(|r| mapping_get(r, "enabled"))
-            .and_then(serde_yaml::Value::as_bool)
-        {
-            self.edits.enabled = enabled;
-        }
+        let remote = mapping_get(&value, "remote");
         if let Some(port) = remote
             .and_then(|r| mapping_get(r, "gateway_addr"))
             .and_then(serde_yaml::Value::as_str)
@@ -284,20 +279,6 @@ impl ConfigPanel {
         {
             self.edits.control_port = port;
         }
-        self.edits.auth_token = remote
-            .and_then(|r| mapping_get(r, "auth_token"))
-            .and_then(serde_yaml::Value::as_str)
-            .filter(|v| !v.is_empty())
-            .map(ToString::to_string);
-        self.edits.readonly_token = remote
-            .and_then(|r| mapping_get(r, "readonly_token"))
-            .and_then(serde_yaml::Value::as_str)
-            .filter(|v| !v.is_empty())
-            .map(ToString::to_string);
-        self.edits.insecure = remote
-            .and_then(|r| mapping_get(r, "insecure"))
-            .and_then(serde_yaml::Value::as_bool)
-            .unwrap_or(false);
         // Provider field values come from remote.providers.<selected>.* — opaque
         // key→value pairs, never interpreted here.
         seed_fields_for_provider(&value, self.edits.provider.as_str(), &mut self.edits.fields);

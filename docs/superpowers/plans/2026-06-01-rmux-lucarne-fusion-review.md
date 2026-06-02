@@ -89,6 +89,20 @@ Cloudflare 凭据伪装成 public tunnel acceptance 已通过；显式设置
 测试也不会打印 connector token。注意：这条验证 Cloudflare REST API contract 与 named
 tunnel 凭据链，不覆盖 `lucarne-remote` 生产路径的 `Cloudflared::start` 二进制执行。
 
+新增可复跑 Quick Tunnel E2E harness：
+
+```bash
+cargo +nightly build -Zbuild-dir-new-layout -p lucarned
+LUCARNE_QUICK_TUNNEL_E2E=1 scripts/remote-quick-tunnel-e2e.sh
+```
+
+该脚本默认跳过，只有显式设置 `LUCARNE_QUICK_TUNNEL_E2E=1` 才触网。它会启动临时
+`lucarned` daemon，使用 Cloudflare Quick Tunnel 打开免费 `trycloudflare.com` URL，
+验证公网 unauth 401、public gateway 不暴露 `/api/remote/*`、full token list 200、
+read-only HTTP create 403、full WS 首帧 `session_list`、read-only WS create 403，
+随后调用 `lucarned remote stop` 并关闭临时 daemon。Quick Tunnel 按 Cloudflare 官方口径只用于
+testing/development，不作为 production 发布替代；production 仍推荐 named tunnel。
+
 2026-06-01 并行 review 复核结论：
 
 - 架构、crate 清理、测试/发布、文档幻觉 4 个只读子代理均完成审查。
@@ -432,10 +446,10 @@ tests 通过。
       `LucarneCore.live_sessions`。
 - [x] TUI Config 补齐 `enabled`、`auth_token`、`readonly_token`、`insecure` 的 seed / edit /
       validate / merge 覆盖。
-- [ ] 集中 remote config read/write/validation 到共享 typed service。
+- [x] 集中 daemon remote config read/validation/default/env merge 到 `remote_config` typed service。
 - [x] 明确 `/chat` 内置 route 删除，`/agent/{id}` 保留 terminal-bound prompt/transcript 语义。
 - [x] 增加 remote lazy-start state transition integration tests。
-- [ ] 增加不依赖真实 rmux monitor 的 public gateway router 隔离 integration test。
+- [x] 增加不依赖真实 rmux monitor 的 public gateway router 隔离 integration test。
 
 退出条件：daemon、TUI、remote control 和 gateway 都使用共享 lifecycle、config 和
 persistence 合同；外部 Web app 只消费公开 gateway API。
@@ -444,22 +458,25 @@ persistence 合同；外部 Web app 只消费公开 gateway API。
 
 - [x] 决定当前 `lucarne-termgw` 保持 rmux-specific；仅保留内部 `TerminalMonitor` test seam，
       不把 `TerminalBackend` 提升成 public abstraction。
-- [ ] 补齐 multi-window/multi-pane selection，或明确限制 pane `(0,0)`。
-- [ ] 接入 `Resync.have_rev`。
-- [ ] 保留 key modifiers 并映射到 input injection。
-- [ ] 将 async hot path 中的 blocking shell 命令改为 bounded `spawn_blocking` 或 process timeout。
+- [x] 明确限制 pane `(0,0)`，并对非 primary pane id 返回显式错误。
+- [x] 接入 `Resync.have_rev`，Resync 前比较客户端 rev 与服务端 baseline 并重新发 full snapshot。
+- [x] 保留 key modifiers 并映射到 rmux/tmux `send-keys` token。
+- [x] 将 rmux CLI shell-out 收敛到统一 resolver，并给非交互调用加 timeout。
 
 退出条件：terminal 行为与 API 暴露模型一致，hot path 没有明显可避免的 blocking work。
 
 ### Phase 3：Public Access Productization
 
-- [ ] 把 real-device public tunnel acceptance test 加入 release checklist。
+- [x] 把 real Quick Tunnel acceptance test 沉淀为 env-gated harness 和 release checklist。
 - [x] 补齐 read-only token 在 `/ws`、`/agent`、write frames 上的覆盖：`/ws` 覆盖
       write-frame refusal，`/agent/{id}` 覆盖 prompt refusal before terminal inject。
 - [x] 增加 env-gated Cloudflare API contract E2E，覆盖 named tunnel create/token/delete，
       不依赖外部设备或真实采集。
-- [ ] 在环境允许时增加 cloudflared binary/provider smoke tests。
-- [ ] 在用户文档中说明 Cloudflare trust boundary 和 named tunnel 推荐。
+- [x] 在环境允许时增加 cloudflared binary/provider Quick Tunnel smoke harness。
+- [x] 在用户文档中说明 Cloudflare Quick Tunnel testing/development 边界和 named tunnel 推荐。
+      `docs/tui.md` 现在包含 release smoke checklist；harness 也把 `HOME` /
+      `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` 隔离到临时目录，避免读取开发机既有
+      cloudflared 配置。
 
 退出条件：public remote access 有明确认证语义、信任边界和可复现 operator docs。
 
@@ -469,23 +486,28 @@ persistence 合同；外部 Web app 只消费公开 gateway API。
 cargo +nightly test -Zbuild-dir-new-layout -p lucarne-termgw
 cargo +nightly test -Zbuild-dir-new-layout -p lucarned
 cargo +nightly test -Zbuild-dir-new-layout -p lucarne-remote
-cargo +nightly clippy -Zbuild-dir-new-layout --all-targets --all-features
+cargo +nightly test -Zbuild-dir-new-layout --workspace --all-features --exclude agent-sessions
+cargo +nightly clippy -Zbuild-dir-new-layout --workspace --all-targets --all-features --exclude agent-sessions --no-deps -- -D warnings
+LUCARNE_QUICK_TUNNEL_E2E=1 scripts/remote-quick-tunnel-e2e.sh
 ```
+
+Clippy matrix 说明：为让 `-D warnings` 在当前 workspace 基线上可复跑，`lucarne`、
+`lucarne-adapter`、`lucarne-telegram`、`lucarne-wechat` 和少量 integration test target
+加入了显式 clippy baseline allow。它只冻结既有结构/测试风格 lint，不代表已经完成
+core runtime / channel adapter 的 clippy 驱动重构；rmux/remote 本轮新增路径仍按具体 lint
+修复收敛。
 
 ## 当前剩余缺口
 
-- `remote` config 顶层字段已由 TUI 覆盖，但 parse / validate / write-back 仍需集中成共享
-  typed service，避免 daemon startup 与 TUI editor 继续维护两套 YAML 逻辑。
-- public gateway router 的 `/api/remote/*` 隔离还缺不依赖真实 rmux monitor 的行为级
-  integration harness。
+- `remote` config daemon read/default/env/validation 已集中到 `remote_config` typed service；
+  TUI write-back 仍保留 YAML merge 层，但 seed 顶层字段复用 typed parse。
+- public gateway router 的 `/api/remote/*` 隔离已有 fake-monitor behavior integration harness。
 - terminal live/E2E 目前有 manifest gate；`/agent/{id}` read-only prompt 已有本地
   WebSocket integration 覆盖，Cloudflare API create/token/delete 已补 env-gated contract
-  E2E，但还没有完整真实设备 / 真实 agent / cloudflared binary public tunnel acceptance
-  证据。
-- rmux binary resolver 仍在 TUI 与 `lucarne-rmux` 间重复，后续应统一并加强本机
-  trust-boundary 校验。
-- multi-window / multi-pane、`Resync.have_rev`、modifier-aware input injection 仍是后续
-  hardening 项。
+  E2E，Quick Tunnel 真实公网 harness 已沉淀为 `scripts/remote-quick-tunnel-e2e.sh`。
+- rmux binary resolver 已统一到 `lucarne-rmux::cli`，TUI 和 monitor 复用同一路径。
+- multi-window / multi-pane 当前明确限制 primary pane `(0,0)`；`Resync.have_rev`、
+  modifier-aware input injection 和 rmux CLI timeout 均已补齐。
 
 ## 上游合并风险图
 

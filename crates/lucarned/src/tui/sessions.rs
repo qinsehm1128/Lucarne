@@ -1,6 +1,6 @@
 //! Sessions panel — the rmux-native session list + action console.
 //!
-//! The backend helpers (`rmux_bin`, `run`, `rmux_out`, `pane_cwd`,
+//! The backend helpers (`run`, `rmux_out`, `pane_cwd`,
 //! `archive_session`, …) were migrated verbatim from the old `lucarne-termctl`
 //! `term` CLI (Decision 2: migrate-don't-rewrite). The gateway-monitored sessions
 //! are driven through the SAME system rmux daemon via its own CLI
@@ -16,9 +16,8 @@
 //! spawns `rmux attach-session` and WAITS for it, then control returns to the TUI.
 
 use std::io::{self, Stdout};
-use std::process::Command;
 
-use lucarne_rmux::{archive, monitor::scrollback_capture_start_arg};
+use lucarne_rmux::{archive, cli, monitor::scrollback_capture_start_arg};
 use ratatui::{backend::CrosstermBackend, widgets::ListState, Terminal};
 
 /// Operator hint shown when `rmux list-sessions` could not be reached (COR-005):
@@ -26,21 +25,9 @@ use ratatui::{backend::CrosstermBackend, widgets::ListState, Terminal};
 /// refresh status line and the empty-state render so the message is identical.
 pub const RMUX_UNREACHABLE_HINT: &str = "rmux unreachable — is the rmux daemon running?";
 
-/// Resolve the `rmux` binary, preferring `~/.cargo/bin/rmux` (the path a
-/// `cargo install rmux` lands on) before falling back to `$PATH`.
-pub fn rmux_bin() -> String {
-    if let Some(home) = std::env::var_os("HOME") {
-        let p = std::path::PathBuf::from(home).join(".cargo/bin/rmux");
-        if p.exists() {
-            return p.to_string_lossy().into_owned();
-        }
-    }
-    "rmux".to_string()
-}
-
 /// Run `rmux <args>` inheriting stdio; return its exit code.
 pub fn run(args: &[&str]) -> i32 {
-    match Command::new(rmux_bin()).args(args).status() {
+    match cli::run_status(args) {
         Ok(status) => status.code().unwrap_or(1),
         Err(e) => {
             eprintln!("term: failed to run rmux: {e}");
@@ -51,7 +38,7 @@ pub fn run(args: &[&str]) -> i32 {
 
 /// Run `rmux <args>` and capture stdout (None on failure).
 pub fn rmux_out(args: &[&str]) -> Option<String> {
-    let out = Command::new(rmux_bin()).args(args).output().ok()?;
+    let out = cli::output(args).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -98,7 +85,13 @@ pub fn list_sessions_raw() -> Option<String> {
 /// should drive this through [`attach_handoff`], which suspends/resumes the TUI
 /// around it; this raw form exists for the (cfg-guarded) test of the argv.
 pub fn attach_session_wait(name: &str) -> i32 {
-    run(&["attach-session", "-t", name])
+    match cli::run_status_interactive(&["attach-session", "-t", name]) {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("term: failed to attach rmux session: {e}");
+            1
+        }
+    }
 }
 
 /// Pop-out handoff (Decision 3): SUSPEND the TUI (`LeaveAlternateScreen` +

@@ -105,6 +105,11 @@ Drives the daemon's loopback control plane (`/api/remote/{start,stop,status}` on
 > Actually opening a tunnel also needs `cloudflared` installed/configured (see the
 > `remote:` section of `lucarned.yaml`).
 
+Cloudflare Quick Tunnel is the zero-config testing/development path used when
+the Cloudflared token is blank. It creates an ephemeral `trycloudflare.com`
+hostname and should not be treated as production availability. For sensitive or
+repeatable access, configure a named tunnel with `token` and `public_url`.
+
 End-to-end (two terminals):
 
 ```bash
@@ -115,6 +120,18 @@ cargo +nightly run -Zbuild-dir-new-layout -p lucarned
 # Terminal B — open the TUI, go to "Go Public", press `s`
 cargo +nightly run -Zbuild-dir-new-layout -p lucarned -- tui
 ```
+
+Release smoke checklist for public access:
+
+```bash
+cargo +nightly build -Zbuild-dir-new-layout -p lucarned
+LUCARNE_QUICK_TUNNEL_E2E=1 scripts/remote-quick-tunnel-e2e.sh
+```
+
+The harness is env-gated and skips by default. When enabled, it starts a
+temporary daemon, opens a Quick Tunnel, verifies public auth/read-only/router
+isolation through the `trycloudflare.com` URL, calls `lucarned remote stop`, and
+then tears the daemon down.
 
 ### Config — edit remote-access config
 

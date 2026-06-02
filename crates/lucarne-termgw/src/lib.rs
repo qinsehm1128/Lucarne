@@ -1463,8 +1463,44 @@ async fn snapshot_into(
     differs: &mut HashMap<SessionId, Differ>,
     session: SessionId,
 ) -> bool {
+    snapshot_into_with_client_rev(monitor, sender, differs, session, None).await
+}
+
+/// Push a fresh full snapshot for `session`, validating the client-supplied
+/// `have_rev` when present before replacing the differ baseline.
+async fn snapshot_into_with_client_rev(
+    monitor: &dyn TerminalMonitor,
+    sender: &mut Sender,
+    differs: &mut HashMap<SessionId, Differ>,
+    session: SessionId,
+    have_rev: Option<u64>,
+) -> bool {
     match monitor.snapshot_grid(&session).await {
         Ok((grid, cursor)) => {
+            if let Some(have_rev) = have_rev {
+                match differs.get(&session).and_then(Differ::current_rev) {
+                    Some(current) if current != have_rev => tracing::debug!(
+                        target: "lucarne_termgw",
+                        %session,
+                        have_rev,
+                        current_rev = current,
+                        "client resync requested with stale revision; sending full snapshot"
+                    ),
+                    Some(current) => tracing::trace!(
+                        target: "lucarne_termgw",
+                        %session,
+                        have_rev,
+                        current_rev = current,
+                        "client resync requested with matching revision; refreshing full snapshot"
+                    ),
+                    None => tracing::debug!(
+                        target: "lucarne_termgw",
+                        %session,
+                        have_rev,
+                        "client resync requested before a server baseline existed; sending full snapshot"
+                    ),
+                }
+            }
             let mut differ = Differ::new();
             let seeded = differ.feed(grid);
             differs.insert(session.clone(), differ);
@@ -1638,12 +1674,16 @@ async fn client_task(
                     Ok(GridUpdate { session, grid, cursor }) => {
                         if subscribed.contains(&session) {
                             let differ = differs.entry(session.clone()).or_default();
-                            let frame = match differ.feed(grid) {
+                            let expected_base = differ.current_rev();
+                            let frame = match differ.feed_checked(grid, expected_base) {
                                 DiffResult::Full(grid) => ServerFrame::Snapshot { session, grid, cursor },
                                 DiffResult::Delta { base_rev, rev, delta } => {
                                     ServerFrame::SnapshotDelta { session, base_rev, rev, delta, cursor }
                                 }
-                                DiffResult::Resync { .. } => continue,
+                                DiffResult::Resync { have_rev } => {
+                                    tracing::debug!(target: "lucarne_termgw", %session, have_rev, "server differ gap; waiting for client resync");
+                                    continue;
+                                }
                             };
                             if !send_frame(&mut sender, &frame).await {
                                 break 'conn;
@@ -1709,8 +1749,15 @@ async fn handle_client_frame(
             }
             true
         }
-        ClientFrame::Resync { session, .. } => {
-            snapshot_into(monitor.as_ref(), sender, differs, session).await
+        ClientFrame::Resync { session, have_rev } => {
+            snapshot_into_with_client_rev(
+                monitor.as_ref(),
+                sender,
+                differs,
+                session,
+                Some(have_rev),
+            )
+            .await
         }
         ClientFrame::CreateSession { title } => {
             // SEC-004: cap sessions created per connection (anti fork-bomb).
@@ -2140,6 +2187,46 @@ mod gate_tests {
         assert!(!is_write_frame(&ClientFrame::Ping { t: 1 }));
     }
 
+    #[test]
+    fn resync_have_rev_is_compared_before_reseeding_differ() {
+        use lucarne_rmux::term::Cell;
+        use lucarne_rmux::{Color, Style};
+
+        fn cell(text: &str) -> Cell {
+            Cell {
+                text: text.to_string(),
+                width: 1,
+                padding: false,
+                fg: Color::Default,
+                bg: Color::Default,
+                underline_color: Color::Default,
+                style: Style::empty(),
+            }
+        }
+
+        let session = "s:0:0".to_string();
+        let mut differs = HashMap::new();
+        let mut differ = Differ::new();
+        differ.feed(PaneGrid {
+            cols: 1,
+            rows: 1,
+            cells: vec![cell("a")],
+            rev: 7,
+        });
+        differs.insert(session.clone(), differ);
+
+        assert_eq!(
+            differs.get(&session).and_then(Differ::current_rev),
+            Some(7),
+            "server baseline is the value Resync.have_rev is compared against"
+        );
+        assert_ne!(
+            differs.get(&session).and_then(Differ::current_rev),
+            Some(3),
+            "a stale client have_rev must be observable before full snapshot reseed"
+        );
+    }
+
     // A read-only session refuses a write frame (returns the connection-keep
     // `true`) without ever touching the monitor; a mirror frame is unaffected by
     // the readonly gate. Driven against the pure classification + the gate's
@@ -2376,6 +2463,52 @@ mod gate_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn sec002_public_gateway_does_not_expose_remote_control_routes() {
+        let temp = tempfile::tempdir().expect("web dir");
+        let monitor = FakeTerminalMonitor::new(Vec::new());
+        let app = router_with_terminal_monitor_and_store(
+            Arc::new(monitor),
+            temp.path().to_path_buf(),
+            AuthState::disabled(),
+            WsConnectionPool::new(GatewayLimits::default()),
+            ControlPlaneSqliteStore::open_in_memory().expect("store"),
+        );
+
+        for (method, path) in [
+            ("GET", "/api/remote/status"),
+            ("POST", "/api/remote/start"),
+            ("POST", "/api/remote/stop"),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(method)
+                        .uri(path)
+                        .extension(ConnectInfo("127.0.0.1:9999".parse::<SocketAddr>().unwrap()))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::OK,
+                "public gateway route {method} {path} must not reach remote control plane"
+            );
+            let body = http_body_util::BodyExt::collect(resp.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            let body = String::from_utf8_lossy(&body);
+            assert!(
+                !body.contains("access_token") && !body.contains("remote subsystem"),
+                "public gateway response must not leak remote control-plane data: {body}"
+            );
+        }
     }
 
     #[tokio::test]

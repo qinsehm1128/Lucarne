@@ -218,6 +218,10 @@ lucarned remote stop
 `remote.enabled: false`, `lucarned` still serves the loopback control plane and
 waits for `lucarned remote start` or the TUI Go Public panel.
 
+Leaving the Cloudflared token blank uses Cloudflare Quick Tunnel: an ephemeral
+`trycloudflare.com` URL intended for testing/development. Use a named tunnel
+(`token` + `public_url`) for sensitive or repeatable remote access.
+
 See [`docs/tui.md`](docs/tui.md) for the full TUI guide (panels, keybindings,
 the daemon requirement for Go Public, and `term` → `lucarned tui` migration).
 

@@ -212,6 +212,9 @@ lucarned remote stop
 时，`lucarned` 仍会提供 loopback control plane，等待 `lucarned remote start` 或 TUI
 Go Public 面板启动隧道。
 
+Cloudflared token 留空时使用 Cloudflare Quick Tunnel：它会生成临时
+`trycloudflare.com` URL，仅适合测试/开发。敏感或需要稳定访问的场景应配置 named
+tunnel（`token` + `public_url`）。
 
 ---
 

@@ -100,7 +100,6 @@ mod tests {
             foreground: PaneColor::rgb(10, 20, 30),
             background: PaneColor::indexed(200),
             underline: PaneColor::ansi(3),
-            ..PaneCell::default()
         };
         let blank = PaneCell::blank();
 

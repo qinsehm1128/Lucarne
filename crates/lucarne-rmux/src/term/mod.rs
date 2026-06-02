@@ -12,6 +12,9 @@ pub mod wire;
 
 pub use diff::{diff, DiffResult, Differ};
 pub use grid::{Cell, CellSpan, Color, Cursor, Dims, GridDelta, PaneGrid, RowDelta, Style};
-pub use input::{control_key_token, ControlKey, KeyMods, TermInput};
-pub use registry::{Origin, SessionDescriptor, SessionId, SessionRegistry};
+pub use input::{control_key_token, key_token, ControlKey, KeyMods, TermInput};
+pub use registry::{
+    primary_pane_session_id, split_primary_pane_session_id, validate_primary_pane_session_id,
+    Origin, PaneSelectionError, SessionDescriptor, SessionId, SessionRegistry,
+};
 pub use wire::{ClientFrame, ServerFrame};

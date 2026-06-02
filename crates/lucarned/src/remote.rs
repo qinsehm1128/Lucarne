@@ -612,12 +612,14 @@ fn build_auth(
 /// is ALWAYS served, even when the tunnel is idle, so `/api/remote/status`
 /// returns the access token + `running:false` from startup and `lucarned remote start`
 /// is never refused with a connection-refused. The rmux monitor + termgw gateway
-/// + tunnel are brought up lazily on the first `start()` (via
-/// [`DaemonRemoteControl::ensure_gateway`]) — either from `lucarned remote start` or, when
-/// `autostart` is set (`remote.enabled:true`), from a single `control.start()`
-/// here at boot (preserving the historical behaviour). An rmux-less environment
-/// therefore no longer crashes the daemon: the control plane stays up and a
-/// `start()` returns a clear [`RemoteControlError`] instead.
+/// + tunnel are brought up lazily on the first `start()`:
+///
+/// - from `lucarned remote start`, or
+/// - when `autostart` is set (`remote.enabled:true`), from a single
+///   `control.start()` here at boot.
+///
+/// An rmux-less environment therefore no longer crashes the daemon: the control
+/// plane stays up and a `start()` returns a clear [`RemoteControlError`] instead.
 ///
 /// Returns the [`RemoteSubsystem`] handle (for daemon logging). Tunnel + gateway
 /// run in spawned tasks; the tunnel is stopped when `shutdown` fires.

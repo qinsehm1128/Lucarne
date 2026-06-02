@@ -39,7 +39,7 @@ remote:
   # tunnel backend. Default-off; this is the highest-severity surface in the
   # project (live terminal mirror + input). See ADR
   # docs/decisions/2026-05-30-remote-access-tunnel-adapter.md.
-  enabled: false # Master gate. Off → daemon never starts a tunnel (default-deny exposure).
+  enabled: false # Autostart gate. Off → control plane stays ready; tunnel starts lazily via `lucarned remote start`.
   provider: cloudflared # Tunnel backend id. Only `cloudflared` is implemented this release.
   gateway_addr: 127.0.0.1:7800 # Gateway bind (the ONLY port the tunnel targets). Forced loopback; the tunnel dials back in.
   control_addr: 127.0.0.1:7801 # Loopback-only control plane (/api/remote/*). DISTINCT port the tunnel never targets (SEC-002); returns the access token.

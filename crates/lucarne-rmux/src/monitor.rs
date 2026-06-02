@@ -25,9 +25,10 @@ use rmux_sdk::{
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
+use crate::cli;
 use crate::term::{
-    control_key_token, Cursor, Dims, Origin, PaneGrid, SessionDescriptor, SessionId,
-    SessionRegistry, TermInput,
+    control_key_token, key_token, primary_pane_session_id, validate_primary_pane_session_id,
+    Cursor, Dims, Origin, PaneGrid, SessionDescriptor, SessionId, SessionRegistry, TermInput,
 };
 
 use crate::adapter;
@@ -40,6 +41,10 @@ const DEFAULT_ROWS: u16 = 32;
 /// `2026-05-30-rmux-terminal-monitor-subsystem.md` boundary rule 5 requires
 /// terminal scrollback/history reads to be bounded windows, not whole-pane scans.
 pub const SCROLLBACK_CAPTURE_LINES: u32 = 1000;
+const _: () = assert!(
+    SCROLLBACK_CAPTURE_LINES > 0 && SCROLLBACK_CAPTURE_LINES <= 1000,
+    "scrollback capture must be a bounded, sane window"
+);
 /// Fan-out buffer for mirror grid updates. A slow subscriber lags (and gets a
 /// `RecvError::Lagged`) rather than back-pressuring the source loops.
 const GRID_BROADCAST_CAP: usize = 256;
@@ -232,10 +237,10 @@ impl RmuxMonitor {
                 .send_text(&text)
                 .await
                 .map_err(|e| MonitorError::Rmux(format!("send_text {id}: {e}")))?,
-            TermInput::Key { code, .. } => pane
-                .send_text(&code)
+            TermInput::Key { code, mods } => pane
+                .send_key(key_token(&code, mods))
                 .await
-                .map_err(|e| MonitorError::Rmux(format!("send_text(key) {id}: {e}")))?,
+                .map_err(|e| MonitorError::Rmux(format!("send_key(key) {id}: {e}")))?,
             TermInput::Control { key } => pane
                 .send_key(control_key_token(&key))
                 .await
@@ -283,9 +288,9 @@ impl RmuxMonitor {
     /// ADR `2026-05-30-rmux-terminal-monitor-subsystem.md` (boundary rule 5):
     /// terminal scrollback reads must be BOUNDED windows, never whole-pane scans.
     /// So this captures the most recent [`SCROLLBACK_CAPTURE_LINES`] lines
-    /// (`-S -<N>`) rather than the entire history (`-S -`). The CLI call uses
-    /// [`tokio::process::Command`] so the async fn never blocks the runtime on a
-    /// synchronous `std::process` wait.
+    /// (`-S -<N>`) rather than the entire history (`-S -`). The CLI call goes
+    /// through [`crate::cli::output_async`], which resolves the binary once and
+    /// bounds the process wait with a timeout.
     pub async fn capture_scrollback(&self, id: &SessionId) -> Result<String> {
         let name = {
             let guard = self.tracked.lock().await;
@@ -295,9 +300,7 @@ impl RmuxMonitor {
                 .ok_or_else(|| MonitorError::NotFound(id.clone()))?
         };
         let start = scrollback_capture_start_arg();
-        let out = tokio::process::Command::new(rmux_bin())
-            .args(["capture-pane", "-p", "-S", &start, "-t", &name])
-            .output()
+        let out = cli::output_async(&["capture-pane", "-p", "-S", &start, "-t", &name])
             .await
             .map_err(|e| MonitorError::Rmux(format!("capture-pane: {e}")))?;
         if !out.status.success() {
@@ -320,6 +323,8 @@ impl RmuxMonitor {
             .map_err(|e| MonitorError::Rmux(format!("open session {}: {e}", name.as_str())))?;
         let pane = session.pane(0, 0);
         let id = session_id(name.as_str());
+        validate_primary_pane_session_id(&id)
+            .map_err(|e| MonitorError::Rmux(format!("primary pane id: {e}")))?;
 
         // Seed dims from the first snapshot (best-effort; fall back to defaults).
         let dims = match pane.snapshot().await {
@@ -435,7 +440,7 @@ impl RmuxMonitor {
 
 /// `session:window:pane` stable handle (window 0 / pane 0).
 fn session_id(name: &str) -> SessionId {
-    format!("{name}:0:0")
+    primary_pane_session_id(name)
 }
 
 /// The user's interactive shell (`$SHELL`, falling back to `/bin/sh`). A freshly
@@ -456,26 +461,12 @@ fn unique_session_name() -> String {
 /// Best-effort pane cwd via the rmux CLI (`#{pane_current_path}`). The SDK has no
 /// cwd accessor, so we ask the same daemon over its tmux-compatible CLI.
 fn pane_cwd(name: &str) -> Option<String> {
-    let out = std::process::Command::new(rmux_bin())
-        .args(["display-message", "-p", "-t", name, "#{pane_current_path}"])
-        .output()
-        .ok()?;
+    let out = cli::output(&["display-message", "-p", "-t", name, "#{pane_current_path}"]).ok()?;
     if !out.status.success() {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (!s.is_empty()).then_some(s)
-}
-
-/// Resolve the rmux binary: `~/.cargo/bin/rmux` if present, else bare `rmux`.
-fn rmux_bin() -> String {
-    if let Some(home) = std::env::var_os("HOME") {
-        let p = std::path::PathBuf::from(home).join(".cargo/bin/rmux");
-        if p.exists() {
-            return p.to_string_lossy().into_owned();
-        }
-    }
-    "rmux".to_string()
 }
 
 #[cfg(test)]
@@ -501,10 +492,6 @@ mod tests {
     // scan is caught without needing a live rmux daemon.
     #[test]
     fn scrollback_capture_window_is_bounded() {
-        assert!(
-            SCROLLBACK_CAPTURE_LINES > 0 && SCROLLBACK_CAPTURE_LINES <= 1000,
-            "scrollback capture must be a bounded, sane window (got {SCROLLBACK_CAPTURE_LINES})"
-        );
         let start = format!("-{SCROLLBACK_CAPTURE_LINES}");
         assert_eq!(
             start, "-1000",
