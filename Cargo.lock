@@ -15,7 +15,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sessions"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "bytes",
  "criterion",
@@ -1726,7 +1726,7 @@ dependencies = [
 
 [[package]]
 name = "lucarne"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "agent-sessions",
  "async-trait",
@@ -1753,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "lucarne-adapter"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "async-trait",
  "lucarne",
@@ -1767,7 +1767,7 @@ dependencies = [
 
 [[package]]
 name = "lucarne-channel"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1780,7 +1780,7 @@ dependencies = [
 
 [[package]]
 name = "lucarne-fakeagent"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "nix",
  "windows-sys 0.61.2",
@@ -1818,7 +1818,7 @@ dependencies = [
 
 [[package]]
 name = "lucarne-telegram"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "agent-sessions",
  "async-trait",
@@ -1865,7 +1865,7 @@ dependencies = [
 
 [[package]]
 name = "lucarne-wechat"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "agent-sessions",
  "async-trait",
@@ -1889,7 +1889,7 @@ dependencies = [
 
 [[package]]
 name = "lucarned"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -1918,7 +1918,7 @@ dependencies = [
 
 [[package]]
 name = "lucarned-ctl"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "reqwest",
  "semver",

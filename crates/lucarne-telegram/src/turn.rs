@@ -16,9 +16,11 @@
 
 use base64::Engine as _;
 #[cfg(test)]
+use lucarne::agent_runtime::AgentInput;
+#[cfg(test)]
 use lucarne::agent_runtime::InterventionRequest;
 use lucarne::agent_runtime::{
-    AgentCommandInvocation, AgentCommandResult, AgentCommandResultData, AgentInput, AgentStatus,
+    AgentCommandInvocation, AgentCommandResult, AgentCommandResultData, AgentStatus,
     Attachment as AgentAttachment, CommandResultEvent, Event, InstanceId, MessageEvent,
     MessageRole,
 };
@@ -37,7 +39,8 @@ use lucarne_channel::{
     robust::retry_attachment_delivery,
     robust::{send_with_fallback, send_with_fallback_all},
     types::{
-        Attachment as ChannelAttachment, ChannelError, MessageId, OutgoingMessage, WorkspaceHandle,
+        Attachment as ChannelAttachment, ChannelError, MessageId, NotificationPolicy,
+        OutgoingMessage, WorkspaceHandle,
     },
     Channel,
 };
@@ -346,6 +349,7 @@ enum DrainOutcome {
 struct PendingAttachmentDelivery {
     attachment: AgentAttachment,
     reply_to: Option<MessageId>,
+    notification: NotificationPolicy,
 }
 
 #[derive(Debug)]
@@ -445,15 +449,7 @@ fn log_event_json(value: &serde_json::Value) -> String {
     log_event_text(&value.to_string(), EVENT_LOG_TEXT_MAX)
 }
 
-pub(crate) async fn run_turn_with_options(
-    channel: &Arc<dyn Channel>,
-    target: &WorkspaceHandle,
-    live: &LiveSession,
-    input: AgentInput,
-    provider_id: &str,
-    options: TurnRunOptions,
-    reply_to: Option<MessageId>,
-) -> Result<TurnRunReport, String> {
+pub(crate) async fn prepare_turn_drain(live: &LiveSession) {
     // 0. Drop any leftover events from a prior turn. With
     //    `Event::TurnCompleted` now being the authoritative end-of-turn
     //    signal, this should almost always be empty in practice — if
@@ -469,14 +465,16 @@ pub(crate) async fn run_turn_with_options(
             "discarded stale events from previous turn (inspect logs above for event kinds)"
         );
     }
+}
 
-    // 1. Submit the prompt.
-    live.session
-        .submit_turn(input)
-        .await
-        .map_err(|e| e.to_string())?;
-    debug!("prompt submitted");
-
+pub(crate) async fn drain_turn_with_options(
+    channel: &Arc<dyn Channel>,
+    target: &WorkspaceHandle,
+    live: &LiveSession,
+    provider_id: &str,
+    options: TurnRunOptions,
+    reply_to: Option<MessageId>,
+) -> Result<TurnRunReport, String> {
     drain_submitted_events(
         channel,
         target,
@@ -942,9 +940,11 @@ async fn send_attachment_delivery_failure(
     provider_id: &str,
     attachment: &AgentAttachment,
     reply_to: Option<MessageId>,
+    notification: NotificationPolicy,
     error: &str,
 ) -> Option<MessageId> {
-    let mut msg = OutgoingMessage::plain(render_attachment_delivery_failure(attachment, error));
+    let mut msg = OutgoingMessage::plain(render_attachment_delivery_failure(attachment, error))
+        .with_notification(notification);
     if let Some(reply_to) = reply_to {
         msg = msg.reply_to(reply_to);
     }
@@ -994,8 +994,11 @@ async fn send_attachment_caption_overflow(
     provider_id: &str,
     body: String,
     reply_to: MessageId,
+    notification: NotificationPolicy,
 ) -> Vec<MessageId> {
-    let msg = OutgoingMessage::plain(body).reply_to(reply_to);
+    let msg = OutgoingMessage::plain(body)
+        .reply_to(reply_to)
+        .with_notification(notification);
     match send_with_fallback_all(channel, target, msg, provider_id).await {
         Ok(ids) => ids,
         Err(err) => {
@@ -1019,8 +1022,9 @@ async fn deliver_pending_attachments(
     for pending in attachments {
         let attachment = pending.attachment;
         let reply_to = pending.reply_to;
+        let notification = pending.notification;
         let (channel_attachment, caption_overflow) =
-            match channel_attachment_from_event(&attachment, reply_to.clone()) {
+            match channel_attachment_from_event(&attachment, reply_to.clone(), notification) {
                 Ok(channel_attachment) => channel_attachment,
                 Err(err) => {
                     warn!(
@@ -1035,6 +1039,7 @@ async fn deliver_pending_attachments(
                         provider_id,
                         &attachment,
                         reply_to,
+                        notification,
                         &err,
                     )
                     .await
@@ -1055,6 +1060,7 @@ async fn deliver_pending_attachments(
                             provider_id,
                             overflow,
                             id,
+                            notification,
                         )
                         .await,
                     );
@@ -1077,6 +1083,7 @@ async fn deliver_pending_attachments(
                     provider_id,
                     &attachment,
                     reply_to,
+                    notification,
                     &failure_error,
                 )
                 .await
@@ -1092,6 +1099,7 @@ async fn deliver_pending_attachments(
 fn channel_attachment_from_event(
     attachment: &AgentAttachment,
     reply_to: Option<MessageId>,
+    notification: NotificationPolicy,
 ) -> Result<(ChannelAttachment, Option<String>), String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(attachment.data_base64.as_bytes())
@@ -1108,7 +1116,8 @@ fn channel_attachment_from_event(
         attachment.filename.to_string(),
         attachment.media_type.to_string(),
         bytes,
-    );
+    )
+    .with_notification(notification);
     let mut caption_overflow = None;
     if let Some(caption) = attachment.caption.as_ref() {
         let (caption, overflow) = split_telegram_attachment_caption(caption.as_str());
@@ -1271,6 +1280,7 @@ async fn drain_events(
                 pending_attachments.push(PendingAttachmentDelivery {
                     attachment,
                     reply_to: drafts.reply_to.clone(),
+                    notification: NotificationPolicy::Notify,
                 });
                 debug!(
                     target: "lucarne_telegram::turn",
@@ -2133,6 +2143,7 @@ mod tests {
         assert_eq!(attachments[0].media_type, "image/png");
         assert_eq!(attachments[0].bytes, vec![1, 2, 3]);
         assert_eq!(attachments[0].caption.as_deref(), Some("caption"));
+        assert_eq!(attachments[0].notification, NotificationPolicy::Notify);
         let recorded = recorder.items.lock().unwrap();
         assert!(recorded
             .iter()
@@ -2160,6 +2171,7 @@ mod tests {
                     caption: Some(caption.into()),
                 },
                 reply_to: None,
+                notification: NotificationPolicy::Notify,
             }],
         )
         .await;
@@ -2180,6 +2192,7 @@ mod tests {
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].body, "TAIL");
         assert_eq!(sends[0].reply_to, Some(MessageId::new("attachment-1")));
+        assert_eq!(sends[0].notification, NotificationPolicy::Notify);
     }
 
     #[tokio::test]
@@ -2279,7 +2292,7 @@ mod tests {
             std::mem::take(&mut report.attachments),
         )
         .await;
-        assert_eq!(ids, vec![MessageId::new("2")]);
+        assert_eq!(ids, vec![MessageId::new("3")]);
         assert_eq!(
             *test_channel.attachment_attempts.lock().unwrap(),
             lucarne_channel::robust::ATTACHMENT_DELIVERY_MAX_RETRIES + 1
@@ -2797,6 +2810,7 @@ mod tests {
         );
 
         assert_eq!(msg.buttons.len(), 2);
+        assert_eq!(msg.notification, NotificationPolicy::Notify);
         assert_eq!(
             registry.actions.lock().unwrap().as_slice(),
             &[
@@ -2832,6 +2846,7 @@ mod tests {
         );
 
         assert!(msg.body.contains("rm delete-target.txt"));
+        assert_eq!(msg.notification, NotificationPolicy::Notify);
         assert!(msg.body.contains("/tmp/repo"));
         assert!(msg.body.contains("Command:"));
         assert!(msg.body.contains("CWD:"));
@@ -3119,7 +3134,8 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|message| message.body == "The"),
+                .any(|message| message.body == "The"
+                    && message.notification == NotificationPolicy::Silent),
             "reasoning should create process output outside the timer status"
         );
         assert!(drafts.fallback_msg_id.is_some());
@@ -3131,8 +3147,15 @@ mod tests {
         let finalized = drafts.finalize(&channel, &target, "pi", None).await;
 
         assert_eq!(finalized.bytes, "下午 1:17".len());
-        let edits = channel.edits.lock().unwrap();
-        assert_eq!(edits.last().expect("final edit").1.body, "下午 1:17");
+        assert_eq!(finalized.message_ids, vec![MessageId::new("2")]);
+        for (_, msg) in channel.edits.lock().unwrap().iter() {
+            assert_eq!(msg.notification, NotificationPolicy::Silent);
+        }
+        let sends = channel.sends.lock().unwrap();
+        assert_eq!(sends.len(), 2);
+        assert_eq!(sends[1].body, "下午 1:17");
+        assert_eq!(sends[1].notification, NotificationPolicy::Notify);
+        assert_eq!(channel.deletes.lock().unwrap().as_slice(), &["1"]);
     }
 
     #[tokio::test]
@@ -3184,7 +3207,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_reply_edits_live_preview_in_place_without_replay() {
+    async fn final_reply_deletes_silent_preview_and_sends_notify_message() {
         let channel = TestChannel::default();
         let target = test_target();
         let mut drafts = DraftStream::new();
@@ -3196,13 +3219,15 @@ mod tests {
         let finalized = drafts.finalize(&channel, &target, "test", None).await;
 
         assert_eq!(finalized.bytes, "这是最终结论".len());
-        assert!(channel.deletes.lock().unwrap().is_empty());
-        assert_eq!(channel.sends.lock().unwrap().len(), 1);
-        let edits = channel.edits.lock().unwrap();
-        let (id, msg) = edits.last().expect("final reply should edit preview");
-        assert_eq!(id, "1");
-        assert_eq!(msg.body, "这是最终结论");
-        assert_eq!(msg.format, lucarne_channel::TextFormat::Markdown);
+        assert_eq!(finalized.message_ids, vec![MessageId::new("2")]);
+        assert_eq!(channel.deletes.lock().unwrap().as_slice(), &["1"]);
+        assert!(channel.edits.lock().unwrap().is_empty());
+        let sends = channel.sends.lock().unwrap();
+        assert_eq!(sends.len(), 2);
+        assert_eq!(sends[0].notification, NotificationPolicy::Silent);
+        assert_eq!(sends[1].body, "这是最终结论");
+        assert_eq!(sends[1].format, lucarne_channel::TextFormat::Markdown);
+        assert_eq!(sends[1].notification, NotificationPolicy::Notify);
     }
 
     #[tokio::test]
@@ -3219,6 +3244,7 @@ mod tests {
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].body, "Use `skills` and **markdown**");
         assert_eq!(sends[0].format, lucarne_channel::TextFormat::Markdown);
+        assert_eq!(sends[0].notification, NotificationPolicy::Notify);
     }
 
     #[tokio::test]
@@ -3240,10 +3266,11 @@ mod tests {
         let sends = channel.sends.lock().unwrap();
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].format, lucarne_channel::TextFormat::Markdown);
+        assert_eq!(sends[0].notification, NotificationPolicy::Silent);
     }
 
     #[tokio::test]
-    async fn final_not_modified_edit_does_not_send_duplicate_reply() {
+    async fn final_reply_does_not_depend_on_preview_edit_success() {
         let channel = TestChannel::default();
         channel.edit_errors.lock().unwrap().push(
             "Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message"
@@ -3259,11 +3286,13 @@ mod tests {
         let finalized = drafts.finalize(&channel, &target, "test", None).await;
 
         assert_eq!(finalized.bytes, "Hello".len());
-        assert_eq!(
-            channel.sends.lock().unwrap().len(),
-            1,
-            "the existing preview already contains the final text"
-        );
+        assert_eq!(finalized.message_ids, vec![MessageId::new("2")]);
+        let sends = channel.sends.lock().unwrap();
+        assert_eq!(sends.len(), 2);
+        assert_eq!(sends[0].notification, NotificationPolicy::Silent);
+        assert_eq!(sends[1].body, "Hello");
+        assert_eq!(sends[1].notification, NotificationPolicy::Notify);
+        assert_eq!(channel.deletes.lock().unwrap().as_slice(), &["1"]);
     }
 
     #[tokio::test]
