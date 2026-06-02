@@ -1788,7 +1788,7 @@ dependencies = [
 
 [[package]]
 name = "lucarne-remote"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -1803,7 +1803,7 @@ dependencies = [
 
 [[package]]
 name = "lucarne-rmux"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "bitflags 2.11.1",
  "dirs",
@@ -1842,7 +1842,7 @@ dependencies = [
 
 [[package]]
 name = "lucarne-termgw"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "async-trait",
  "axum",
