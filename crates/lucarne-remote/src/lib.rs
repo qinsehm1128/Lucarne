@@ -125,9 +125,7 @@ impl RequiredField {
             return true;
         }
         match self.required_when {
-            Some((gate_key, ANY_VALUE)) => {
-                cfg.get(gate_key).is_some_and(|v| !v.is_empty())
-            }
+            Some((gate_key, ANY_VALUE)) => cfg.get(gate_key).is_some_and(|v| !v.is_empty()),
             Some((gate_key, gate_value)) => cfg.get(gate_key) == Some(gate_value),
             None => false,
         }
@@ -207,6 +205,16 @@ pub trait RemoteAccessProvider: Send + Sync {
     /// Fields this provider needs, used to drive CLI prompting.
     fn required_fields(&self) -> &[RequiredField];
 
+    /// Deprecated provider-owned config section names accepted as compatibility
+    /// aliases for `remote.providers.<provider-id>`.
+    ///
+    /// The daemon treats these as opaque section names supplied by the provider
+    /// descriptor. Concrete alias names, field keys, and compatibility policy
+    /// stay at the provider boundary instead of becoming daemon/common schema.
+    fn compat_config_sections(&self) -> &[&'static str] {
+        &[]
+    }
+
     /// Operator-facing warnings about a given configuration (H6a).
     ///
     /// Lets a provider surface security/operational caveats about the config it
@@ -254,11 +262,7 @@ pub trait RemoteAccessProvider: Send + Sync {
     }
 
     /// Start a tunnel from `local` and return a handle carrying the public URL.
-    async fn start(
-        &self,
-        local: SocketAddr,
-        cfg: &ProviderConfig,
-    ) -> RemoteResult<TunnelHandle>;
+    async fn start(&self, local: SocketAddr, cfg: &ProviderConfig) -> RemoteResult<TunnelHandle>;
 
     /// Stop a previously started tunnel, consuming its handle.
     async fn stop(&self, handle: TunnelHandle) -> RemoteResult<()>;
@@ -318,7 +322,10 @@ impl RemoteRegistry {
 
     /// Ids of all registered providers, in registration order.
     pub fn ids(&self) -> Vec<&'static str> {
-        self.providers.iter().map(|provider| provider.id()).collect()
+        self.providers
+            .iter()
+            .map(|provider| provider.id())
+            .collect()
     }
 
     /// Alias for [`ids`](Self::ids) — mirrors `AdapterRegistry` enumerate naming.

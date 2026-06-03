@@ -1,11 +1,11 @@
 //! Sessions panel — the rmux-native session list + action console.
 //!
-//! The backend helpers (`rmux_bin`, `run`, `rmux_out`, `pane_cwd`,
+//! The backend helpers (`run`, `rmux_out`, `pane_cwd`,
 //! `archive_session`, …) were migrated verbatim from the old `lucarne-termctl`
 //! `term` CLI (Decision 2: migrate-don't-rewrite). The gateway-monitored sessions
 //! are driven through the SAME system rmux daemon via its own CLI
 //! (`list-sessions` / `attach-session` / `detach-client` / `kill-session`), plus
-//! the shared [`lucarne_archive`] store, so no control-plane IPC is introduced
+//! the shared [`lucarne_rmux::archive`] store, so no control-plane IPC is introduced
 //! (Decision 5).
 //!
 //! On top of those primitives this module hosts [`SessionsPanel`]: a ratatui
@@ -16,8 +16,8 @@
 //! spawns `rmux attach-session` and WAITS for it, then control returns to the TUI.
 
 use std::io::{self, Stdout};
-use std::process::Command;
 
+use lucarne_rmux::{archive, cli, monitor::scrollback_capture_start_arg};
 use ratatui::{backend::CrosstermBackend, widgets::ListState, Terminal};
 
 /// Operator hint shown when `rmux list-sessions` could not be reached (COR-005):
@@ -25,21 +25,9 @@ use ratatui::{backend::CrosstermBackend, widgets::ListState, Terminal};
 /// refresh status line and the empty-state render so the message is identical.
 pub const RMUX_UNREACHABLE_HINT: &str = "rmux unreachable — is the rmux daemon running?";
 
-/// Resolve the `rmux` binary, preferring `~/.cargo/bin/rmux` (the path a
-/// `cargo install rmux` lands on) before falling back to `$PATH`.
-pub fn rmux_bin() -> String {
-    if let Some(home) = std::env::var_os("HOME") {
-        let p = std::path::PathBuf::from(home).join(".cargo/bin/rmux");
-        if p.exists() {
-            return p.to_string_lossy().into_owned();
-        }
-    }
-    "rmux".to_string()
-}
-
 /// Run `rmux <args>` inheriting stdio; return its exit code.
 pub fn run(args: &[&str]) -> i32 {
-    match Command::new(rmux_bin()).args(args).status() {
+    match cli::run_status(args) {
         Ok(status) => status.code().unwrap_or(1),
         Err(e) => {
             eprintln!("term: failed to run rmux: {e}");
@@ -50,7 +38,7 @@ pub fn run(args: &[&str]) -> i32 {
 
 /// Run `rmux <args>` and capture stdout (None on failure).
 pub fn rmux_out(args: &[&str]) -> Option<String> {
-    let out = Command::new(rmux_bin()).args(args).output().ok()?;
+    let out = cli::output(args).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -62,6 +50,15 @@ pub fn pane_cwd(name: &str) -> Option<String> {
     rmux_out(&["display-message", "-p", "-t", name, "#{pane_current_path}"])
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+fn capture_scrollback_args<'a>(start: &'a str, name: &'a str) -> [&'a str; 6] {
+    ["capture-pane", "-p", "-S", start, "-t", name]
+}
+
+fn capture_scrollback(name: &str) -> Option<String> {
+    let start = scrollback_capture_start_arg();
+    rmux_out(&capture_scrollback_args(&start, name))
 }
 
 /// Capture `rmux list-sessions` output with an EXPLICIT format (COR-006) so the
@@ -88,7 +85,13 @@ pub fn list_sessions_raw() -> Option<String> {
 /// should drive this through [`attach_handoff`], which suspends/resumes the TUI
 /// around it; this raw form exists for the (cfg-guarded) test of the argv.
 pub fn attach_session_wait(name: &str) -> i32 {
-    run(&["attach-session", "-t", name])
+    match cli::run_status_interactive(&["attach-session", "-t", name]) {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("term: failed to attach rmux session: {e}");
+            1
+        }
+    }
 }
 
 /// Pop-out handoff (Decision 3): SUSPEND the TUI (`LeaveAlternateScreen` +
@@ -194,13 +197,13 @@ pub fn kill_session(name: &str) -> i32 {
 pub fn archive_session(name: &str) -> Result<String, String> {
     let session_id = format!("{name}:0:0");
     let cwd = pane_cwd(name);
-    let content = rmux_out(&["capture-pane", "-p", "-S", "-", "-t", name]).unwrap_or_default();
-    match lucarne_archive::save(
+    let content = capture_scrollback(name).unwrap_or_default();
+    match archive::save(
         &session_id,
         name,
         cwd.as_deref(),
         &content,
-        lucarne_archive::now_epoch(),
+        archive::now_epoch(),
     ) {
         Ok(archive_id) => {
             run(&["kill-session", "-t", name]);
@@ -485,6 +488,16 @@ mod tests {
     fn parse_sessions_empty_output_is_empty() {
         assert!(parse_sessions("").is_empty());
         assert!(parse_sessions("   \n\t\n").is_empty());
+    }
+
+    #[test]
+    fn archive_capture_args_are_bounded() {
+        let start = scrollback_capture_start_arg();
+        assert_ne!(start, "-", "TUI archive must not capture full pane history");
+        assert_eq!(
+            capture_scrollback_args(&start, "work"),
+            ["capture-pane", "-p", "-S", "-1000", "-t", "work"]
+        );
     }
 
     #[test]

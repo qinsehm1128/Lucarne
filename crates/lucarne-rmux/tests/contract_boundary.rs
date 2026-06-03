@@ -1,27 +1,14 @@
-//! Boundary contract: `lucarne-rmux` is the SINGLE layer that names `rmux_sdk`.
+//! Boundary contract: `lucarne-rmux` is the terminal capability package.
 //!
-//! The terminal-monitor subsystem's boundary invariant (its `Cargo.toml`
-//! comment + ADR `2026-05-30-rmux-terminal-monitor-subsystem.md`) is that the
-//! live rmux-sdk binding is confined to this one crate — preview-API churn
-//! stops here, and every value it emits is the rmux-free `lucarne-term`
-//! vocabulary. This test is the POSITIVE counterpart to
-//! `lucarne-term/tests/contract_boundary.rs` (which guards that `lucarne-term`
-//! stays rmux-free): here we assert that `lucarne-rmux`'s own dependency graph
-//! DOES contain `rmux-sdk`, so the binding lives exactly where the boundary
-//! says it should.
-//!
-//! Mirrors `lucarne-adapter/tests/contract_boundary.rs`: it asserts on the
-//! `cargo tree` dependency graph (same invocation + string parse) rather than a
-//! compile-time check.
+//! Terminal domain/wire types, archive helpers, and the live rmux-sdk binding
+//! intentionally live together here. Preview-API churn stops at this crate, and
+//! downstream gateway/daemon crates consume the stable `lucarne_rmux` surface
+//! instead of naming `rmux_sdk` directly.
 
 use std::process::Command;
 
 #[test]
-fn rmux_contract_depends_on_rmux_sdk() {
-    // Same `cargo tree -p <crate> --no-dev` invocation + parse as the adapter
-    // contract test. `--no-dev` keeps the comparison to the production graph;
-    // should this cargo reject the flag (empty stdout), fall back to the plain
-    // tree so the positive guard still validates the dependency presence.
+fn rmux_contract_owns_rmux_sdk_binding() {
     let stdout = cargo_tree(&["tree", "-p", "lucarne-rmux", "--no-dev"]);
     let stdout = if stdout.trim().is_empty() {
         cargo_tree(&["tree", "-p", "lucarne-rmux"])
@@ -35,10 +22,52 @@ fn rmux_contract_depends_on_rmux_sdk() {
     );
 }
 
+#[test]
+fn gateway_and_daemon_do_not_name_rmux_sdk_directly() {
+    let workspace = workspace_root();
+    for manifest in [
+        "crates/lucarne-termgw/Cargo.toml",
+        "crates/lucarned/Cargo.toml",
+    ] {
+        let content = std::fs::read_to_string(workspace.join(manifest)).expect("read manifest");
+        assert!(
+            !content.contains("rmux-sdk"),
+            "{manifest} must consume rmux-sdk through lucarne-rmux, not directly"
+        );
+    }
+}
+
+#[test]
+fn rmux_contract_exports_terminal_and_archive_modules() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for relative in [
+        "src/term/mod.rs",
+        "src/term/grid.rs",
+        "src/term/diff.rs",
+        "src/term/input.rs",
+        "src/term/registry.rs",
+        "src/term/wire.rs",
+        "src/archive.rs",
+    ] {
+        assert!(
+            root.join(relative).exists(),
+            "lucarne-rmux must own merged terminal/archive module {relative}"
+        );
+    }
+}
+
 fn cargo_tree(args: &[&str]) -> String {
     let output = Command::new("cargo")
         .args(args)
         .output()
         .expect("run cargo tree");
     String::from_utf8(output.stdout).unwrap()
+}
+
+fn workspace_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root")
+        .to_path_buf()
 }

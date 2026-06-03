@@ -190,7 +190,7 @@ fn runtime_modules_have_structured_tracing_or_are_declared_pure() {
         "crates/lucarned/src/onboarding/mod.rs",
         "crates/lucarned/src/onboarding/session.rs",
         "crates/lucarned/src/onboarding/terminal.rs",
-        // `lucarned tui` dashboard (feature-gated behind `tui`): an interactive,
+        // `lucarned tui` dashboard: an interactive,
         // synchronous front-end that surfaces state through on-screen panels and
         // status lines, not a daemon-runtime path. Like the onboarding modules
         // above, it is observability-pure by design (no structured tracing).
@@ -201,6 +201,7 @@ fn runtime_modules_have_structured_tracing_or_are_declared_pure() {
         "crates/lucarned/src/tui/sessions.rs",
         "crates/lucarned/src/tui/remote.rs",
         "crates/lucarned/src/tui/config.rs",
+        "crates/lucarned/src/tui/nav.rs",
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();

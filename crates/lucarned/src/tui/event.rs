@@ -65,4 +65,3 @@ pub fn handle_next(app: &mut App) -> std::io::Result<SessionAction> {
     }
     Ok(SessionAction::None)
 }
-

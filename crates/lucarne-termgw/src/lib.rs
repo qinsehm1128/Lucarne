@@ -8,8 +8,8 @@
 //! - **HTTP `/api/sessions`** — `GET` lists monitored sessions, `POST` creates a
 //!   shell session, `DELETE /api/sessions/{id}` kills one. This is what the thin
 //!   CLI hits (pop-out/retract itself is rmux-native and does not go through here).
-//! - **Static** — anything else is served from the web asset dir (the dual-mode
-//!   web app).
+//! - **Static** — anything else is served from the web asset dir. Production web
+//!   apps are external consumers of this gateway API.
 //!
 //! ## Concurrency
 //! Output fan-out is the monitor's `broadcast`; each ws client owns its own set
@@ -38,9 +38,11 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast::error::RecvError;
 use tower_http::services::ServeDir;
 
-use lucarne_rmux::{GridUpdate, RmuxMonitor};
-use lucarne_term::{
-    ClientFrame, DiffResult, Differ, ServerFrame, SessionDescriptor, SessionId, TermInput,
+use lucarne::control_plane::ControlPlaneSqliteStore;
+use lucarne::terminal_agent_bind;
+use lucarne_rmux::{
+    archive, ClientFrame, Cursor, DiffResult, Differ, GridUpdate, MonitorError, PaneGrid,
+    RmuxMonitor, ServerFrame, SessionDescriptor, SessionId, TermInput,
 };
 
 pub mod auth;
@@ -82,7 +84,7 @@ pub struct RemoteControlStatus {
 
 /// Optional control-plane overrides for `POST /api/remote/start` (G3).
 ///
-/// The CLI (`term go-public`) collects the chosen provider id + that provider's
+/// The CLI (`lucarned remote start`) collects the chosen provider id + that provider's
 /// fields and posts them here. When present they override / merge with the
 /// daemon's pre-configured tunnel; when absent the daemon falls back to its
 /// `lucarned.yaml` pre-configured provider + config (backward compatible).
@@ -186,13 +188,59 @@ impl std::error::Error for RemoteControlError {}
 /// Shared gateway state (cheap to clone — `Arc` to the monitor plus the auth layer).
 #[derive(Clone)]
 struct AppState {
-    monitor: Arc<RmuxMonitor>,
+    monitor: Arc<dyn TerminalMonitor>,
+    control_store: ControlPlaneSqliteStore,
     auth: AuthState,
     /// Connection/session caps + ws session lifetime knobs (SEC-004/SEC-006).
     limits: GatewayLimits,
     /// Global concurrent-ws-connection permit pool (SEC-004 / H1). Shared across
-    /// all ws routes (`/ws`, `/agent/{id}`, and the merged `/chat`).
+    /// all gateway ws routes (`/ws` and `/agent/{id}`).
     ws_pool: WsConnectionPool,
+}
+
+/// Narrow monitor seam used by the gateway. Production wires this to
+/// [`RmuxMonitor`]; tests can provide a fake without launching a system rmux
+/// daemon.
+#[async_trait]
+trait TerminalMonitor: Send + Sync {
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<GridUpdate>;
+    async fn sessions(&self) -> Vec<SessionDescriptor>;
+    async fn create(&self, title: String) -> Result<SessionDescriptor, MonitorError>;
+    async fn snapshot_grid(&self, id: &SessionId) -> Result<(PaneGrid, Cursor), MonitorError>;
+    async fn inject(&self, id: &SessionId, input: TermInput) -> Result<(), MonitorError>;
+    async fn kill(&self, id: &SessionId) -> Result<(), MonitorError>;
+    async fn capture_scrollback(&self, id: &SessionId) -> Result<String, MonitorError>;
+}
+
+#[async_trait]
+impl TerminalMonitor for RmuxMonitor {
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<GridUpdate> {
+        self.subscribe()
+    }
+
+    async fn sessions(&self) -> Vec<SessionDescriptor> {
+        self.sessions().await
+    }
+
+    async fn create(&self, title: String) -> Result<SessionDescriptor, MonitorError> {
+        self.create(title).await
+    }
+
+    async fn snapshot_grid(&self, id: &SessionId) -> Result<(PaneGrid, Cursor), MonitorError> {
+        self.snapshot_grid(id).await
+    }
+
+    async fn inject(&self, id: &SessionId, input: TermInput) -> Result<(), MonitorError> {
+        self.inject(id, input).await
+    }
+
+    async fn kill(&self, id: &SessionId) -> Result<(), MonitorError> {
+        self.kill(id).await
+    }
+
+    async fn capture_scrollback(&self, id: &SessionId) -> Result<String, MonitorError> {
+        self.capture_scrollback(id).await
+    }
 }
 
 /// Tunable connection/session limits + ws session lifetime (SEC-004 / SEC-006).
@@ -231,12 +279,12 @@ impl Default for GatewayLimits {
 /// Shared ws-connection governor (SEC-004 / H1): the [`GatewayLimits`] plus the
 /// SINGLE global connection-permit pool that every ws route draws from.
 ///
-/// Cloning shares the same underlying semaphore (`Arc`), so building one pool and
-/// handing clones to both the termgw router (`/ws`, `/agent`) and the merged
-/// `lucarne-web` `/chat` route makes them all obey ONE `max_ws_connections` cap
-/// and the same idle / lifetime / inbound-frame-rate knobs. `/chat` previously
-/// bypassed all of these (it was only ticket-gated); routing it through this pool
-/// is the H1 fix.
+/// Cloning shares the same underlying semaphore (`Arc`). The daemon builds one
+/// pool for the gateway so `/ws` and `/agent` obey one `max_ws_connections` cap
+/// and the same idle / lifetime / inbound-frame-rate knobs. In-process extension
+/// routes can use [`authorize_ws`] with the same pool, but production Web apps
+/// should consume the gateway API directly rather than merge a Lucarne-owned web
+/// runtime route.
 #[derive(Clone)]
 pub struct WsConnectionPool {
     limits: GatewayLimits,
@@ -297,10 +345,18 @@ where
             Some(ConnectInfo(peer)) if peer.ip().is_loopback() => Ok(LoopbackOnly),
             Some(ConnectInfo(peer)) => {
                 tracing::warn!(target: "lucarne_termgw", %peer, "rejected non-loopback access to /api/remote control plane");
-                Err((StatusCode::FORBIDDEN, "remote control plane is loopback-only").into_response())
+                Err((
+                    StatusCode::FORBIDDEN,
+                    "remote control plane is loopback-only",
+                )
+                    .into_response())
             }
             // No connect info recorded — fail closed.
-            None => Err((StatusCode::FORBIDDEN, "remote control plane is loopback-only").into_response()),
+            None => Err((
+                StatusCode::FORBIDDEN,
+                "remote control plane is loopback-only",
+            )
+                .into_response()),
         }
     }
 }
@@ -346,7 +402,9 @@ where
 
 /// Build the gateway router with auth **disabled** (local dev on loopback).
 pub fn router(monitor: Arc<RmuxMonitor>, web_dir: PathBuf) -> Router {
-    router_with_auth(monitor, web_dir, AuthState::disabled())
+    let control_store = ControlPlaneSqliteStore::open_in_memory()
+        .expect("in-memory control-plane store for local gateway router");
+    router_with_auth_and_store(monitor, web_dir, AuthState::disabled(), control_store)
 }
 
 /// Build the gateway router: ws mirror + control API + static web assets, gated
@@ -363,7 +421,36 @@ pub fn router(monitor: Arc<RmuxMonitor>, web_dir: PathBuf) -> Router {
 /// that lives on a separate loopback listener ([`control_router`] /
 /// [`serve_control_plane`]) the tunnel never targets.
 pub fn router_with_auth(monitor: Arc<RmuxMonitor>, web_dir: PathBuf, auth: AuthState) -> Router {
-    router_with_limits(monitor, web_dir, auth, GatewayLimits::default())
+    let control_store = ControlPlaneSqliteStore::open_in_memory()
+        .expect("in-memory control-plane store for local gateway router");
+    router_with_auth_and_store(monitor, web_dir, auth, control_store)
+}
+
+/// Build the gateway router with auth disabled and an explicit Lucarne
+/// control-plane store. Daemon entrypoints use this so terminal-agent bindings
+/// persist as core cold state instead of a sidecar DB.
+pub fn router_with_store(
+    monitor: Arc<RmuxMonitor>,
+    web_dir: PathBuf,
+    control_store: ControlPlaneSqliteStore,
+) -> Router {
+    router_with_auth_and_store(monitor, web_dir, AuthState::disabled(), control_store)
+}
+
+/// Build the gateway router with explicit auth and Lucarne control-plane store.
+pub fn router_with_auth_and_store(
+    monitor: Arc<RmuxMonitor>,
+    web_dir: PathBuf,
+    auth: AuthState,
+    control_store: ControlPlaneSqliteStore,
+) -> Router {
+    router_with_limits_and_store(
+        monitor,
+        web_dir,
+        auth,
+        GatewayLimits::default(),
+        control_store,
+    )
 }
 
 /// Build the tunneled gateway router with explicit connection/session limits
@@ -376,22 +463,64 @@ pub fn router_with_limits(
     auth: AuthState,
     limits: GatewayLimits,
 ) -> Router {
-    router_with_pool(monitor, web_dir, auth, WsConnectionPool::new(limits))
+    let control_store = ControlPlaneSqliteStore::open_in_memory()
+        .expect("in-memory control-plane store for local gateway router");
+    router_with_limits_and_store(monitor, web_dir, auth, limits, control_store)
+}
+
+/// Build the gateway router with explicit limits and Lucarne control-plane store.
+pub fn router_with_limits_and_store(
+    monitor: Arc<RmuxMonitor>,
+    web_dir: PathBuf,
+    auth: AuthState,
+    limits: GatewayLimits,
+    control_store: ControlPlaneSqliteStore,
+) -> Router {
+    router_with_pool_and_store(
+        monitor,
+        web_dir,
+        auth,
+        WsConnectionPool::new(limits),
+        control_store,
+    )
 }
 
 /// Build the tunneled gateway router sharing an EXISTING [`WsConnectionPool`]
-/// (H1). Use this when the merged `lucarne-web` `/chat` route must draw from the
-/// SAME connection-permit pool as `/ws` + `/agent` so one global
-/// `max_ws_connections` cap (and the same idle/lifetime/frame-rate limits)
-/// governs every ws route on the port.
+/// (H1). Daemon remote uses this so `/ws` and `/agent` draw from the same global
+/// connection cap and session lifetime policy.
 pub fn router_with_pool(
     monitor: Arc<RmuxMonitor>,
     web_dir: PathBuf,
     auth: AuthState,
     ws_pool: WsConnectionPool,
 ) -> Router {
+    let control_store = ControlPlaneSqliteStore::open_in_memory()
+        .expect("in-memory control-plane store for local gateway router");
+    router_with_pool_and_store(monitor, web_dir, auth, ws_pool, control_store)
+}
+
+/// Build the gateway router sharing an existing ws pool and using the provided
+/// Lucarne control-plane store for terminal-agent binding history.
+pub fn router_with_pool_and_store(
+    monitor: Arc<RmuxMonitor>,
+    web_dir: PathBuf,
+    auth: AuthState,
+    ws_pool: WsConnectionPool,
+    control_store: ControlPlaneSqliteStore,
+) -> Router {
+    router_with_terminal_monitor_and_store(monitor, web_dir, auth, ws_pool, control_store)
+}
+
+fn router_with_terminal_monitor_and_store(
+    monitor: Arc<dyn TerminalMonitor>,
+    web_dir: PathBuf,
+    auth: AuthState,
+    ws_pool: WsConnectionPool,
+    control_store: ControlPlaneSqliteStore,
+) -> Router {
     let state = AppState {
         monitor,
+        control_store,
         auth,
         limits: ws_pool.limits(),
         ws_pool,
@@ -451,8 +580,7 @@ pub fn control_router(remote_control: Option<Arc<dyn RemoteControl>>) -> Router 
 /// query param via [`AuthState::tickets`] BEFORE the wrapped handler runs (so it
 /// rejects with 401 *before* any `.on_upgrade()`). No-op when auth is disabled
 /// (local dev). Apply it to any ws router that must share the gateway's auth —
-/// e.g. the merged `lucarne-web` `/chat` router, which otherwise bypasses all
-/// auth (it does not inherit the gateway router's gates across `merge`).
+/// for example a local test or an optional in-process extension route.
 ///
 /// NOTE: this gate enforces auth only — it does NOT apply [`GatewayLimits`] /
 /// the connection-permit pool. A ws route that must also obey the global
@@ -466,9 +594,9 @@ pub fn gate_ws_router(inner: Router, auth: AuthState) -> Router {
 /// Authorize a ws upgrade for a route that shares the gateway's auth + limits
 /// (SEC-001 / SEC-004 / H1 / M5).
 ///
-/// This is the single seam another crate's ws handler (the merged `lucarne-web`
-/// `/chat`) calls at the very top of its upgrade handler so it is governed by
-/// the SAME rules as termgw's `/ws` + `/agent`:
+/// This is the seam an optional in-process ws handler can call at the top of its
+/// upgrade path when it must be governed by the same rules as termgw's `/ws` and
+/// `/agent`:
 ///
 /// 1. **Acquire a connection permit FIRST** from the shared [`WsConnectionPool`]
 ///    (M5): a saturated global cap returns `Err(503)` WITHOUT consuming the
@@ -613,14 +741,19 @@ async fn bearer_guard(
 /// bearer → scope (constant-time, rate-limited, with the readonly tier), and it
 /// always runs before this handler ([`bearer_guard`] gates `/auth/ticket`). A
 /// missing extension (which would only happen if the route were ever detached
-/// from `bearer_guard`) fails CLOSED to read-only rather than silently minting a
-/// full-access ticket.
+/// from `bearer_guard`) is rejected by the extractor before this handler mints
+/// any ticket.
 async fn issue_ticket(
     State(s): State<AppState>,
     axum::Extension(scope): axum::Extension<AccessScope>,
 ) -> Response {
-    let ticket = s.auth.tickets.issue_scoped(scope).await;
-    Json(json!({ "ticket": ticket })).into_response()
+    match s.auth.tickets.issue_scoped(scope).await {
+        Ok(ticket) => Json(json!({ "ticket": ticket })).into_response(),
+        Err(e) => {
+            tracing::warn!(target: "lucarne_termgw", error = %e, "ws ticket issuance refused");
+            (StatusCode::TOO_MANY_REQUESTS, e.to_string()).into_response()
+        }
+    }
 }
 
 /// Bind `addr` and serve the gateway with auth **disabled** (local dev, loopback).
@@ -666,7 +799,10 @@ pub async fn serve_with_auth(
     if remote && !addr.ip().is_loopback() {
         let err = GatewayAddrError::NonLoopback(addr);
         tracing::error!(target: "lucarne_termgw", %err, "refusing to bind a non-loopback address in remote mode");
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string()));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            err.to_string(),
+        ));
     }
 
     // SEC-002: this serves only the tunneled gateway surface; the `/api/remote/*`
@@ -696,7 +832,10 @@ pub async fn serve_control_plane(
     if !addr.ip().is_loopback() {
         let err = GatewayAddrError::NonLoopback(addr);
         tracing::error!(target: "lucarne_termgw", %err, "refusing to bind a non-loopback control-plane address");
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string()));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            err.to_string(),
+        ));
     }
     let app = control_router(remote_control);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -732,7 +871,10 @@ async fn http_remote_start(
         Ok(params) => params,
         Err(detail) => {
             tracing::warn!(target: "lucarne_termgw", %detail, "remote tunnel start rejected — malformed body");
-            return (StatusCode::BAD_REQUEST, format!("invalid request body: {detail}"))
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid request body: {detail}"),
+            )
                 .into_response();
         }
     };
@@ -858,9 +1000,9 @@ async fn http_agent(State(s): State<AppState>, Path(id): Path<String>) -> Respon
     let Some(cwd) = session_cwd(&s, &id).await else {
         return (StatusCode::NOT_FOUND, "session has no known cwd").into_response();
     };
-    match lucarne_agentbind::bind(&cwd) {
+    match terminal_agent_bind::bind(&cwd) {
         Some(agent) => {
-            let (msgs, _) = lucarne_agentbind::read_messages(&agent.transcript, 0);
+            let (msgs, _) = terminal_agent_bind::read_messages(&agent.transcript, 0);
             Json(json!({
                 "bound": true,
                 "kind": agent.kind,
@@ -889,10 +1031,7 @@ struct TicketQuery {
 /// missing/expired/already-used; `Ok(scope)` to proceed with the consumed
 /// ticket's [`AccessScope`] (SEC-013). When auth is disabled this is always
 /// `Ok(AccessScope::Full)` (local dev — no readonly tier without a token).
-async fn check_ws_ticket(
-    auth: &AuthState,
-    ticket: Option<&str>,
-) -> Result<AccessScope, Response> {
+async fn check_ws_ticket(auth: &AuthState, ticket: Option<&str>) -> Result<AccessScope, Response> {
     if !auth.mode.is_enforced() {
         return Ok(AccessScope::Full);
     }
@@ -1002,20 +1141,33 @@ async fn agent_client_inner(
     let (mut tx, mut rx) = socket.split();
 
     let Some(cwd) = session_cwd(s, id).await else {
-        let _ = send_value(&mut tx, &json!({"type":"error","msg":"session has no known cwd"})).await;
+        let _ = send_value(
+            &mut tx,
+            &json!({"type":"error","msg":"session has no known cwd"}),
+        )
+        .await;
         return;
     };
-    let Some(agent) = lucarne_agentbind::bind(&cwd) else {
-        let _ = send_value(&mut tx, &json!({"type":"error","msg":"no agent transcript bound to this cwd","cwd":cwd})).await;
+    let Some(agent) = terminal_agent_bind::bind(&cwd) else {
+        let _ = send_value(
+            &mut tx,
+            &json!({"type":"error","msg":"no agent transcript bound to this cwd","cwd":cwd}),
+        )
+        .await;
         return;
     };
     if !send_value(&mut tx, &json!({"type":"ready","kind":agent.kind,"session_id":agent.session_id,"cwd":cwd,"readonly":readonly})).await {
         return;
     }
 
-    let (initial, mut offset) = lucarne_agentbind::read_messages(&agent.transcript, 0);
+    let (initial, mut offset) = terminal_agent_bind::read_messages(&agent.transcript, 0);
     for m in &initial {
-        if !send_value(&mut tx, &json!({"type":"message","role":m.role,"text":m.text})).await {
+        if !send_value(
+            &mut tx,
+            &json!({"type":"message","role":m.role,"text":m.text}),
+        )
+        .await
+        {
             return;
         }
     }
@@ -1059,7 +1211,7 @@ async fn agent_client_inner(
                 Some(Err(_)) => break,
             },
             _ = tick.tick() => {
-                let (new_msgs, new_off) = lucarne_agentbind::read_messages(&agent.transcript, offset);
+                let (new_msgs, new_off) = terminal_agent_bind::read_messages(&agent.transcript, offset);
                 offset = new_off;
                 for m in &new_msgs {
                     if !send_value(&mut tx, &json!({"type":"message","role":m.role,"text":m.text})).await {
@@ -1089,7 +1241,13 @@ async fn http_archive(
         return (StatusCode::NOT_FOUND, "unknown session").into_response();
     };
     let content = s.monitor.capture_scrollback(&id).await.unwrap_or_default();
-    let archive_id = match archive::save(&id, &desc.title, desc.cwd.as_deref(), &content, now_epoch()) {
+    let archive_id = match archive::save(
+        &id,
+        &desc.title,
+        desc.cwd.as_deref(),
+        &content,
+        archive::now_epoch(),
+    ) {
         Ok(a) => a,
         // SEC-007: generic client message; detail logged server-side only.
         Err(e) => {
@@ -1115,13 +1273,6 @@ async fn http_archive_get(Path(archive_id): Path<String>) -> Response {
     }
 }
 
-fn now_epoch() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 // ---- agent session pickers (live-bound + history) ----
 
 /// Monitored panes that currently have a bound agent transcript (for the chat
@@ -1130,20 +1281,28 @@ async fn http_agents(State(s): State<AppState>) -> Response {
     let mut agents = Vec::new();
     for d in s.monitor.sessions().await {
         if let Some(cwd) = &d.cwd {
-            if let Some(a) = lucarne_agentbind::bind(cwd) {
+            if let Some(a) = terminal_agent_bind::bind(cwd) {
                 // Record the rmux↔agent binding so chat history shows ONLY
-                // rmux-related sessions (never a blind ~/.claude scan).
-                lucarne_agentbind::db::record(
-                    &a.kind, &a.session_id, cwd, &d.id, &d.title,
-                    &a.transcript.to_string_lossy(),
-                );
+                // rmux-related sessions (never a blind ~/.claude scan). The
+                // observation is cold core control-plane state, not a side DB.
+                if let Err(e) = terminal_agent_bind::record(
+                    &s.control_store,
+                    &a.kind,
+                    &a.session_id,
+                    cwd,
+                    &d.id,
+                    &d.title,
+                    &a.transcript,
+                ) {
+                    tracing::warn!(target: "lucarne_termgw", error = %e, "terminal-agent binding record failed");
+                }
                 agents.push(json!({
                     "term_session": d.id,
                     "title": d.title,
                     "cwd": cwd,
                     "kind": a.kind,
                     "agent_session_id": a.session_id,
-                    "summary": lucarne_agentbind::first_user_message(&a.transcript),
+                    "summary": terminal_agent_bind::first_user_message(&a.transcript),
                 }));
             }
         }
@@ -1153,8 +1312,14 @@ async fn http_agents(State(s): State<AppState>) -> Response {
 
 /// Recent rmux-related agent sessions (from the SQLite registry, NOT a global
 /// transcript scan — only sessions ever bound to an rmux pane appear).
-async fn http_agent_history() -> Response {
-    let rows = lucarne_agentbind::db::history(40);
+async fn http_agent_history(State(s): State<AppState>) -> Response {
+    let rows = match terminal_agent_bind::history(&s.control_store, 40) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(target: "lucarne_termgw", error = %e, "terminal-agent history read failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
     Json(json!({
         "sessions": rows.iter().map(|r| json!({
             "kind": r.kind,
@@ -1170,79 +1335,24 @@ async fn http_agent_history() -> Response {
 }
 
 /// Messages of one recorded history transcript (read-only — no live pane).
-async fn http_agent_history_get(Path(session): Path<String>) -> Response {
-    let Some(path) = lucarne_agentbind::db::transcript_path(&session) else {
-        return StatusCode::NOT_FOUND.into_response();
+async fn http_agent_history_get(
+    State(s): State<AppState>,
+    Path(session): Path<String>,
+) -> Response {
+    let path = match terminal_agent_bind::transcript_path(&s.control_store, &session) {
+        Ok(Some(path)) => path,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::warn!(target: "lucarne_termgw", error = %e, "terminal-agent transcript lookup failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
     };
-    let (msgs, _) = lucarne_agentbind::read_messages(std::path::Path::new(&path), 0);
+    let (msgs, _) = terminal_agent_bind::read_messages(&path, 0);
     Json(json!({
         "session_id": session,
         "messages": msgs.iter().map(|m| json!({"role": m.role, "text": m.text})).collect::<Vec<_>>(),
     }))
     .into_response()
-}
-
-mod archive {
-    use std::fs;
-    use std::path::PathBuf;
-
-    use serde_json::{json, Value};
-
-    fn dir() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".lucarne")
-            .join("term-archive")
-    }
-
-    pub fn save(
-        session_id: &str,
-        title: &str,
-        cwd: Option<&str>,
-        content: &str,
-        ts: u64,
-    ) -> std::io::Result<String> {
-        let d = dir();
-        fs::create_dir_all(&d)?;
-        let archive_id = format!("{}-{}", session_id.replace([':', '/'], "_"), ts);
-        let record = json!({
-            "archive_id": archive_id,
-            "session_id": session_id,
-            "title": title,
-            "cwd": cwd,
-            "archived_at": ts,
-            "content": content,
-        });
-        fs::write(d.join(format!("{archive_id}.json")), serde_json::to_vec(&record)?)?;
-        Ok(archive_id)
-    }
-
-    pub fn list() -> Vec<Value> {
-        let mut out = Vec::new();
-        if let Ok(rd) = fs::read_dir(dir()) {
-            for entry in rd.flatten() {
-                if entry.path().extension().and_then(|x| x.to_str()) != Some("json") {
-                    continue;
-                }
-                let Ok(bytes) = fs::read(entry.path()) else { continue };
-                let Ok(v) = serde_json::from_slice::<Value>(&bytes) else { continue };
-                out.push(json!({
-                    "archive_id": v.get("archive_id"),
-                    "session_id": v.get("session_id"),
-                    "title": v.get("title"),
-                    "cwd": v.get("cwd"),
-                    "archived_at": v.get("archived_at"),
-                }));
-            }
-        }
-        out.sort_by(|a, b| b["archived_at"].as_u64().cmp(&a["archived_at"].as_u64()));
-        out
-    }
-
-    pub fn get(archive_id: &str) -> Option<Value> {
-        let bytes = fs::read(dir().join(format!("{archive_id}.json"))).ok()?;
-        serde_json::from_slice(&bytes).ok()
-    }
 }
 
 // ---- file tree (P8): browse the pane's cwd ----
@@ -1285,7 +1395,10 @@ async fn http_files(
         }
     }
     // Directories first, then case-insensitive by name.
-    entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+    entries.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then(a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+    });
 
     let rel = target
         .strip_prefix(&base_c)
@@ -1345,13 +1458,49 @@ async fn send_frame(sender: &mut Sender, frame: &ServerFrame) -> bool {
 
 /// Push a fresh full snapshot for `session` and (re)seed its differ baseline.
 async fn snapshot_into(
-    monitor: &RmuxMonitor,
+    monitor: &dyn TerminalMonitor,
     sender: &mut Sender,
     differs: &mut HashMap<SessionId, Differ>,
     session: SessionId,
 ) -> bool {
+    snapshot_into_with_client_rev(monitor, sender, differs, session, None).await
+}
+
+/// Push a fresh full snapshot for `session`, validating the client-supplied
+/// `have_rev` when present before replacing the differ baseline.
+async fn snapshot_into_with_client_rev(
+    monitor: &dyn TerminalMonitor,
+    sender: &mut Sender,
+    differs: &mut HashMap<SessionId, Differ>,
+    session: SessionId,
+    have_rev: Option<u64>,
+) -> bool {
     match monitor.snapshot_grid(&session).await {
         Ok((grid, cursor)) => {
+            if let Some(have_rev) = have_rev {
+                match differs.get(&session).and_then(Differ::current_rev) {
+                    Some(current) if current != have_rev => tracing::debug!(
+                        target: "lucarne_termgw",
+                        %session,
+                        have_rev,
+                        current_rev = current,
+                        "client resync requested with stale revision; sending full snapshot"
+                    ),
+                    Some(current) => tracing::trace!(
+                        target: "lucarne_termgw",
+                        %session,
+                        have_rev,
+                        current_rev = current,
+                        "client resync requested with matching revision; refreshing full snapshot"
+                    ),
+                    None => tracing::debug!(
+                        target: "lucarne_termgw",
+                        %session,
+                        have_rev,
+                        "client resync requested before a server baseline existed; sending full snapshot"
+                    ),
+                }
+            }
             let mut differ = Differ::new();
             let seeded = differ.feed(grid);
             differs.insert(session.clone(), differ);
@@ -1417,7 +1566,7 @@ impl FrameRate {
 }
 
 async fn client_task(
-    monitor: Arc<RmuxMonitor>,
+    monitor: Arc<dyn TerminalMonitor>,
     socket: WebSocket,
     limits: GatewayLimits,
     scope: AccessScope,
@@ -1525,12 +1674,16 @@ async fn client_task(
                     Ok(GridUpdate { session, grid, cursor }) => {
                         if subscribed.contains(&session) {
                             let differ = differs.entry(session.clone()).or_default();
-                            let frame = match differ.feed(grid) {
+                            let expected_base = differ.current_rev();
+                            let frame = match differ.feed_checked(grid, expected_base) {
                                 DiffResult::Full(grid) => ServerFrame::Snapshot { session, grid, cursor },
                                 DiffResult::Delta { base_rev, rev, delta } => {
                                     ServerFrame::SnapshotDelta { session, base_rev, rev, delta, cursor }
                                 }
-                                DiffResult::Resync { .. } => continue,
+                                DiffResult::Resync { have_rev } => {
+                                    tracing::debug!(target: "lucarne_termgw", %session, have_rev, "server differ gap; waiting for client resync");
+                                    continue;
+                                }
                             };
                             if !send_frame(&mut sender, &frame).await {
                                 break 'conn;
@@ -1540,7 +1693,7 @@ async fn client_task(
                     Err(RecvError::Lagged(n)) => {
                         tracing::debug!(target: "lucarne_termgw", skipped = n, "client lagged; re-snapshotting subscriptions");
                         for session in subscribed.iter().cloned().collect::<Vec<_>>() {
-                            if !snapshot_into(&monitor, &mut sender, &mut differs, session).await {
+                            if !snapshot_into(monitor.as_ref(), &mut sender, &mut differs, session).await {
                                 break 'conn;
                             }
                         }
@@ -1572,7 +1725,7 @@ fn is_write_frame(frame: &ClientFrame) -> bool {
 /// runs (see [`is_write_frame`]), so this handler only ever sees frames the
 /// session is permitted to perform.
 async fn handle_client_frame(
-    monitor: &Arc<RmuxMonitor>,
+    monitor: &Arc<dyn TerminalMonitor>,
     sender: &mut Sender,
     subscribed: &mut HashSet<SessionId>,
     differs: &mut HashMap<SessionId, Differ>,
@@ -1583,7 +1736,7 @@ async fn handle_client_frame(
     match frame {
         ClientFrame::Subscribe { session } => {
             subscribed.insert(session.clone());
-            snapshot_into(monitor, sender, differs, session).await
+            snapshot_into(monitor.as_ref(), sender, differs, session).await
         }
         ClientFrame::Detach { session } => {
             subscribed.remove(&session);
@@ -1596,8 +1749,15 @@ async fn handle_client_frame(
             }
             true
         }
-        ClientFrame::Resync { session, .. } => {
-            snapshot_into(monitor, sender, differs, session).await
+        ClientFrame::Resync { session, have_rev } => {
+            snapshot_into_with_client_rev(
+                monitor.as_ref(),
+                sender,
+                differs,
+                session,
+                Some(have_rev),
+            )
+            .await
         }
         ClientFrame::CreateSession { title } => {
             // SEC-004: cap sessions created per connection (anti fork-bomb).
@@ -1608,27 +1768,42 @@ async fn handle_client_frame(
                 );
                 return send_frame(
                     sender,
-                    &ServerFrame::Error { code: 429, msg: "session limit reached".to_string() },
+                    &ServerFrame::Error {
+                        code: 429,
+                        msg: "session limit reached".to_string(),
+                    },
                 )
                 .await;
             }
-            match monitor.create(title.unwrap_or_else(|| "shell".to_string())).await {
+            match monitor
+                .create(title.unwrap_or_else(|| "shell".to_string()))
+                .await
+            {
                 Ok(desc) => {
                     *sessions_created += 1;
-                    if !send_frame(sender, &ServerFrame::SessionCreated { session: desc.id }).await {
+                    if !send_frame(sender, &ServerFrame::SessionCreated { session: desc.id }).await
+                    {
                         return false;
                     }
                     send_frame(
                         sender,
-                        &ServerFrame::SessionList { sessions: monitor.sessions().await },
+                        &ServerFrame::SessionList {
+                            sessions: monitor.sessions().await,
+                        },
                     )
                     .await
                 }
                 Err(e) => {
                     // SEC-007: detail logged server-side; client gets generic.
                     tracing::warn!(target: "lucarne_termgw", error = %e, "ws session create failed");
-                    send_frame(sender, &ServerFrame::Error { code: 500, msg: "internal error".to_string() })
-                        .await
+                    send_frame(
+                        sender,
+                        &ServerFrame::Error {
+                            code: 500,
+                            msg: "internal error".to_string(),
+                        },
+                    )
+                    .await
                 }
             }
         }
@@ -1641,15 +1816,23 @@ async fn handle_client_frame(
                 }
                 send_frame(
                     sender,
-                    &ServerFrame::SessionList { sessions: monitor.sessions().await },
+                    &ServerFrame::SessionList {
+                        sessions: monitor.sessions().await,
+                    },
                 )
                 .await
             }
             Err(e) => {
                 // SEC-007: detail logged server-side; client gets generic.
                 tracing::warn!(target: "lucarne_termgw", %session, error = %e, "ws session close failed");
-                send_frame(sender, &ServerFrame::Error { code: 501, msg: "internal error".to_string() })
-                    .await
+                send_frame(
+                    sender,
+                    &ServerFrame::Error {
+                        code: 501,
+                        msg: "internal error".to_string(),
+                    },
+                )
+                .await
             }
         },
         ClientFrame::Ping { t } => send_frame(sender, &ServerFrame::Pong { t }).await,
@@ -1667,7 +1850,10 @@ mod gate_tests {
     async fn ws_gate_noop_when_auth_disabled() {
         let auth = AuthState::disabled();
         // Disabled (local dev): no ticket required, never refuses; always full.
-        assert_eq!(check_ws_ticket(&auth, None).await.ok(), Some(AccessScope::Full));
+        assert_eq!(
+            check_ws_ticket(&auth, None).await.ok(),
+            Some(AccessScope::Full)
+        );
         assert_eq!(
             check_ws_ticket(&auth, Some("anything")).await.ok(),
             Some(AccessScope::Full)
@@ -1691,7 +1877,7 @@ mod gate_tests {
         let held = pool.try_acquire().expect("first permit");
         // A fresh, valid ticket exists — but the cap is full, so authorize must
         // 503 and must NOT consume the ticket.
-        let ticket = auth.tickets.issue().await;
+        let ticket = auth.tickets.issue().await.expect("issue ticket");
         let resp = authorize_ws(&auth, Some(&ticket), &pool).await;
         assert!(resp.is_err(), "cap full → reject");
         assert_eq!(
@@ -1713,7 +1899,7 @@ mod gate_tests {
         let resp = authorize_ws(&auth, Some("forged"), &pool).await;
         assert!(resp.is_err());
         assert_eq!(resp.err().unwrap().status(), StatusCode::UNAUTHORIZED);
-        let ticket2 = auth.tickets.issue().await;
+        let ticket2 = auth.tickets.issue().await.expect("issue ticket");
         let (_scope, _permit) = authorize_ws(&auth, Some(&ticket2), &pool)
             .await
             .expect("permit was released after auth failure");
@@ -1809,7 +1995,7 @@ mod gate_tests {
     #[tokio::test]
     async fn ws_gate_accepts_valid_ticket_once_then_replay_fails() {
         let auth = AuthState::with_token(AccessToken::generate());
-        let ticket = auth.tickets.issue().await;
+        let ticket = auth.tickets.issue().await.expect("issue ticket");
         // First use: valid ticket consumed → proceed (Ok = no refusal).
         assert_eq!(
             check_ws_ticket(&auth, Some(&ticket)).await.ok(),
@@ -1855,13 +2041,21 @@ mod gate_tests {
 
         // A ticket minted under the readonly scope consumes back to ReadOnly,
         // and the ws gate surfaces that scope to the handler.
-        let ro_ticket = auth.tickets.issue_scoped(AccessScope::ReadOnly).await;
+        let ro_ticket = auth
+            .tickets
+            .issue_scoped(AccessScope::ReadOnly)
+            .await
+            .expect("issue read-only ticket");
         assert_eq!(
             check_ws_ticket(&auth, Some(&ro_ticket)).await.ok(),
             Some(AccessScope::ReadOnly)
         );
         // A full-scope ticket consumes back to Full.
-        let full_ticket = auth.tickets.issue_scoped(AccessScope::Full).await;
+        let full_ticket = auth
+            .tickets
+            .issue_scoped(AccessScope::Full)
+            .await
+            .expect("issue full ticket");
         assert_eq!(
             check_ws_ticket(&auth, Some(&full_ticket)).await.ok(),
             Some(AccessScope::Full)
@@ -1874,19 +2068,21 @@ mod gate_tests {
     // → `issue_scoped` body, no AppState/live monitor needed): an extension-
     // injecting layer feeds the handler exactly as `bearer_guard` does, and the
     // minted ticket round-trips to the injected scope. A request with NO scope
-    // extension (which would only happen off `bearer_guard`) fails CLOSED to
-    // ReadOnly rather than minting a Full ticket.
+    // extension (which would only happen off `bearer_guard`) is rejected before a
+    // ticket can be minted.
     #[tokio::test]
-    async fn issue_ticket_reads_scope_from_extension_not_header() {
-        // Stand-in for `issue_ticket`'s body: scope comes from the extension, with
-        // the same fail-closed-to-ReadOnly default the real handler uses.
+    async fn issue_ticket_reads_scope_from_extension_and_rejects_missing_scope() {
+        // Stand-in for `issue_ticket`'s body: scope is required from the
+        // extension, matching the real handler's `Extension<AccessScope>`
+        // extractor. No extension means no ticket.
         async fn ticket_handler(
             State(auth): State<AuthState>,
-            scope: Option<axum::Extension<AccessScope>>,
+            axum::Extension(scope): axum::Extension<AccessScope>,
         ) -> Response {
-            let scope = scope.map(|e| e.0).unwrap_or(AccessScope::ReadOnly);
-            let ticket = auth.tickets.issue_scoped(scope).await;
-            Json(json!({ "ticket": ticket })).into_response()
+            match auth.tickets.issue_scoped(scope).await {
+                Ok(ticket) => Json(json!({ "ticket": ticket })).into_response(),
+                Err(e) => (StatusCode::TOO_MANY_REQUESTS, e.to_string()).into_response(),
+            }
         }
 
         let auth = AuthState::with_tokens(AccessToken::generate(), AccessToken::generate());
@@ -1945,8 +2141,9 @@ mod gate_tests {
             "full scope extension must mint a full ticket"
         );
 
-        // No scope extension at all → fail CLOSED to ReadOnly (never a Full
-        // fallback), even if a Full bearer header were present and ignored.
+        // No scope extension at all → extractor rejects the request before
+        // `issue_scoped` can mint any ticket, even if a Full bearer header were
+        // present and ignored.
         let resp = app
             .oneshot(
                 HttpRequest::builder()
@@ -1961,17 +2158,12 @@ mod gate_tests {
             )
             .await
             .unwrap();
-        let none = minted_ticket(resp).await;
-        assert_eq!(
-            auth.tickets.consume_scoped(&none).await,
-            Some(AccessScope::ReadOnly),
-            "missing scope extension must fail closed to readonly (no header re-parse / Full fallback)"
-        );
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
     fn write_frames_are_classified_for_readonly_refusal() {
-        use lucarne_term::TermInput;
+        use lucarne_rmux::TermInput;
         // Write frames: input + session lifecycle.
         assert!(is_write_frame(&ClientFrame::Input {
             session: "s:0:0".into(),
@@ -1995,6 +2187,46 @@ mod gate_tests {
         assert!(!is_write_frame(&ClientFrame::Ping { t: 1 }));
     }
 
+    #[test]
+    fn resync_have_rev_is_compared_before_reseeding_differ() {
+        use lucarne_rmux::term::Cell;
+        use lucarne_rmux::{Color, Style};
+
+        fn cell(text: &str) -> Cell {
+            Cell {
+                text: text.to_string(),
+                width: 1,
+                padding: false,
+                fg: Color::Default,
+                bg: Color::Default,
+                underline_color: Color::Default,
+                style: Style::empty(),
+            }
+        }
+
+        let session = "s:0:0".to_string();
+        let mut differs = HashMap::new();
+        let mut differ = Differ::new();
+        differ.feed(PaneGrid {
+            cols: 1,
+            rows: 1,
+            cells: vec![cell("a")],
+            rev: 7,
+        });
+        differs.insert(session.clone(), differ);
+
+        assert_eq!(
+            differs.get(&session).and_then(Differ::current_rev),
+            Some(7),
+            "server baseline is the value Resync.have_rev is compared against"
+        );
+        assert_ne!(
+            differs.get(&session).and_then(Differ::current_rev),
+            Some(3),
+            "a stale client have_rev must be observable before full snapshot reseed"
+        );
+    }
+
     // A read-only session refuses a write frame (returns the connection-keep
     // `true`) without ever touching the monitor; a mirror frame is unaffected by
     // the readonly gate. Driven against the pure classification + the gate's
@@ -2003,10 +2235,12 @@ mod gate_tests {
     async fn readonly_session_refuses_write_frames() {
         // The refusal short-circuits before the monitor is consulted: assert the
         // classification the gate uses to decide.
-        use lucarne_term::TermInput;
+        use lucarne_rmux::TermInput;
         let write = ClientFrame::Input {
             session: "s:0:0".into(),
-            event: TermInput::Text { text: "rm -rf /\n".into() },
+            event: TermInput::Text {
+                text: "rm -rf /\n".into(),
+            },
         };
         // readonly + write → must be classified as a write (and thus refused).
         assert!(is_write_frame(&write));
@@ -2044,26 +2278,115 @@ mod gate_tests {
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt;
 
-    /// A stand-in for `lucarne-web`'s `/chat` ws route: it upgrades immediately,
-    /// exactly like the real one — so if the gate lets the request through, the
-    /// response is a 101/426-style upgrade attempt rather than our 401.
-    async fn dummy_chat_upgrade(ws: WebSocketUpgrade) -> Response {
+    #[derive(Clone)]
+    struct FakeTerminalMonitor {
+        sessions: Arc<tokio::sync::Mutex<Vec<SessionDescriptor>>>,
+        injections: Arc<tokio::sync::Mutex<Vec<(SessionId, TermInput)>>>,
+        updates: tokio::sync::broadcast::Sender<GridUpdate>,
+    }
+
+    impl FakeTerminalMonitor {
+        fn new(sessions: Vec<SessionDescriptor>) -> Self {
+            let (updates, _) = tokio::sync::broadcast::channel(16);
+            Self {
+                sessions: Arc::new(tokio::sync::Mutex::new(sessions)),
+                injections: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                updates,
+            }
+        }
+
+        async fn injections(&self) -> Vec<(SessionId, TermInput)> {
+            self.injections.lock().await.clone()
+        }
+    }
+
+    fn claude_session_line(cwd: &str, session_id: &str) -> String {
+        format!(
+            r#"{{"type":"user","sessionId":"{session_id}","cwd":"{cwd}","timestamp":"2026-05-30T00:00:00Z","message":{{"role":"user","content":[{{"type":"text","text":"hello there"}}]}}}}"#
+        )
+    }
+
+    fn claude_assistant_line() -> String {
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi back"}],"stop_reason":"end_turn"}}"#.to_string()
+    }
+
+    #[async_trait]
+    impl TerminalMonitor for FakeTerminalMonitor {
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<GridUpdate> {
+            self.updates.subscribe()
+        }
+
+        async fn sessions(&self) -> Vec<SessionDescriptor> {
+            self.sessions.lock().await.clone()
+        }
+
+        async fn create(&self, title: String) -> Result<SessionDescriptor, MonitorError> {
+            let id = format!("fake-{}:0:0", self.sessions.lock().await.len());
+            let desc = SessionDescriptor {
+                id: id.clone(),
+                title,
+                origin: lucarne_rmux::Origin::Managed,
+                dims: lucarne_rmux::Dims { cols: 80, rows: 24 },
+                cwd: None,
+            };
+            self.sessions.lock().await.push(desc.clone());
+            Ok(desc)
+        }
+
+        async fn snapshot_grid(&self, id: &SessionId) -> Result<(PaneGrid, Cursor), MonitorError> {
+            Err(MonitorError::NotFound(id.clone()))
+        }
+
+        async fn inject(&self, id: &SessionId, input: TermInput) -> Result<(), MonitorError> {
+            self.injections.lock().await.push((id.clone(), input));
+            Ok(())
+        }
+
+        async fn kill(&self, id: &SessionId) -> Result<(), MonitorError> {
+            let mut sessions = self.sessions.lock().await;
+            let before = sessions.len();
+            sessions.retain(|session| session.id != *id);
+            if sessions.len() == before {
+                return Err(MonitorError::NotFound(id.clone()));
+            }
+            Ok(())
+        }
+
+        async fn capture_scrollback(&self, id: &SessionId) -> Result<String, MonitorError> {
+            if self
+                .sessions
+                .lock()
+                .await
+                .iter()
+                .any(|session| session.id == *id)
+            {
+                Ok("fake scrollback".to_string())
+            } else {
+                Err(MonitorError::NotFound(id.clone()))
+            }
+        }
+    }
+
+    /// A stand-in for an external extension ws route: it upgrades immediately,
+    /// so if the gate lets the request through, the response is a 101/426-style
+    /// upgrade attempt rather than our 401.
+    async fn dummy_extension_upgrade(ws: WebSocketUpgrade) -> Response {
         ws.on_upgrade(|_socket| async {})
     }
 
-    fn dummy_chat_router() -> Router {
-        Router::new().route("/chat", get(dummy_chat_upgrade))
+    fn dummy_extension_router() -> Router {
+        Router::new().route("/extension-ws", get(dummy_extension_upgrade))
     }
 
     #[tokio::test]
-    async fn sec001_chat_gate_refuses_without_ticket_when_enforced() {
+    async fn sec001_extension_gate_refuses_without_ticket_when_enforced() {
         // Auth enforced + no ticket → the gate rejects with 401 BEFORE upgrade.
         let auth = AuthState::with_token(AccessToken::generate());
-        let app = gate_ws_router(dummy_chat_router(), auth);
+        let app = gate_ws_router(dummy_extension_router(), auth);
         let resp = app
             .oneshot(
                 HttpRequest::builder()
-                    .uri("/chat")
+                    .uri("/extension-ws")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2073,15 +2396,15 @@ mod gate_tests {
     }
 
     #[tokio::test]
-    async fn sec001_chat_gate_refuses_invalid_ticket_but_allows_valid_once() {
+    async fn sec001_extension_gate_refuses_invalid_ticket_but_allows_valid_once() {
         let auth = AuthState::with_token(AccessToken::generate());
 
         // Forged ticket → 401.
-        let app = gate_ws_router(dummy_chat_router(), auth.clone());
+        let app = gate_ws_router(dummy_extension_router(), auth.clone());
         let resp = app
             .oneshot(
                 HttpRequest::builder()
-                    .uri("/chat?ticket=forged")
+                    .uri("/extension-ws?ticket=forged")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2091,12 +2414,12 @@ mod gate_tests {
 
         // A valid single-use ticket passes the gate (so it reaches the upgrade
         // handler — which, lacking ws upgrade headers, is NOT our 401).
-        let ticket = auth.tickets.issue().await;
-        let app = gate_ws_router(dummy_chat_router(), auth.clone());
+        let ticket = auth.tickets.issue().await.expect("issue ticket");
+        let app = gate_ws_router(dummy_extension_router(), auth.clone());
         let resp = app
             .oneshot(
                 HttpRequest::builder()
-                    .uri(format!("/chat?ticket={ticket}"))
+                    .uri(format!("/extension-ws?ticket={ticket}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2110,13 +2433,13 @@ mod gate_tests {
     }
 
     #[tokio::test]
-    async fn sec001_chat_gate_is_noop_when_auth_disabled() {
+    async fn sec001_extension_gate_is_noop_when_auth_disabled() {
         // Local dev: gate is a pass-through, the upgrade handler runs.
-        let app = gate_ws_router(dummy_chat_router(), AuthState::disabled());
+        let app = gate_ws_router(dummy_extension_router(), AuthState::disabled());
         let resp = app
             .oneshot(
                 HttpRequest::builder()
-                    .uri("/chat")
+                    .uri("/extension-ws")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2140,6 +2463,172 @@ mod gate_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn sec002_public_gateway_does_not_expose_remote_control_routes() {
+        let temp = tempfile::tempdir().expect("web dir");
+        let monitor = FakeTerminalMonitor::new(Vec::new());
+        let app = router_with_terminal_monitor_and_store(
+            Arc::new(monitor),
+            temp.path().to_path_buf(),
+            AuthState::disabled(),
+            WsConnectionPool::new(GatewayLimits::default()),
+            ControlPlaneSqliteStore::open_in_memory().expect("store"),
+        );
+
+        for (method, path) in [
+            ("GET", "/api/remote/status"),
+            ("POST", "/api/remote/start"),
+            ("POST", "/api/remote/stop"),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(method)
+                        .uri(path)
+                        .extension(ConnectInfo("127.0.0.1:9999".parse::<SocketAddr>().unwrap()))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::OK,
+                "public gateway route {method} {path} must not reach remote control plane"
+            );
+            let body = http_body_util::BodyExt::collect(resp.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            let body = String::from_utf8_lossy(&body);
+            assert!(
+                !body.contains("access_token") && !body.contains("remote subsystem"),
+                "public gateway response must not leak remote control-plane data: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_ws_readonly_prompt_refuses_before_terminal_inject() {
+        let temp = tempfile::tempdir().expect("temp claude config");
+        let cwd = temp.path().join("workspace");
+        std::fs::create_dir_all(&cwd).expect("workspace");
+        let projects = temp.path().join("projects").join("term-agent");
+        std::fs::create_dir_all(&projects).expect("claude projects");
+        let transcript = projects.join("sess-agent.jsonl");
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                claude_session_line(cwd.to_str().unwrap(), "sess-agent"),
+                claude_assistant_line()
+            ),
+        )
+        .expect("write transcript");
+
+        let session_id = "agent-session:0:0".to_string();
+        let monitor = FakeTerminalMonitor::new(vec![SessionDescriptor {
+            id: session_id.clone(),
+            title: "agent".to_string(),
+            origin: lucarne_rmux::Origin::Adopted,
+            dims: lucarne_rmux::Dims { cols: 80, rows: 24 },
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+        }]);
+
+        let full = AccessToken::generate();
+        let readonly = AccessToken::generate();
+        let auth = AuthState::with_tokens(full, readonly.clone());
+        let app = router_with_terminal_monitor_and_store(
+            Arc::new(monitor.clone()),
+            temp.path().join("web"),
+            auth.clone(),
+            WsConnectionPool::new(GatewayLimits {
+                idle_timeout: std::time::Duration::from_secs(30),
+                max_session_lifetime: std::time::Duration::from_secs(30),
+                ..GatewayLimits::default()
+            }),
+            ControlPlaneSqliteStore::open_in_memory().expect("store"),
+        );
+
+        let prev = std::env::var_os("CLAUDE_CONFIG_DIR");
+        unsafe {
+            std::env::set_var("CLAUDE_CONFIG_DIR", temp.path());
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        });
+
+        let ticket = auth
+            .tickets
+            .issue_scoped(AccessScope::ReadOnly)
+            .await
+            .expect("issue readonly ticket");
+        let url = format!("ws://{addr}/agent/{session_id}?ticket={ticket}");
+        let (mut socket, _response) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect agent ws");
+
+        let ready = socket
+            .next()
+            .await
+            .expect("ready frame")
+            .expect("ready ok")
+            .into_text()
+            .expect("ready text");
+        let ready: Value = serde_json::from_str(&ready).expect("ready json");
+        assert_eq!(ready["type"], "ready");
+        assert_eq!(ready["readonly"], true);
+
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"type":"prompt","text":"should not inject"}"#.into(),
+            ))
+            .await
+            .expect("send readonly prompt");
+        let mut refusal = None;
+        for _ in 0..5 {
+            let frame = socket
+                .next()
+                .await
+                .expect("agent frame")
+                .expect("agent frame ok")
+                .into_text()
+                .expect("agent text");
+            let value: Value = serde_json::from_str(&frame).expect("agent json");
+            if value["type"] == "error" {
+                refusal = Some(value);
+                break;
+            }
+        }
+        let refusal = refusal.expect("read-only prompt refusal frame");
+        assert_eq!(refusal["type"], "error");
+        assert_eq!(
+            refusal["msg"],
+            "read-only session: prompts are not permitted"
+        );
+        assert!(
+            monitor.injections().await.is_empty(),
+            "read-only prompt must be refused before terminal injection"
+        );
+
+        let _ = socket.close(None).await;
+        server.abort();
+        match prev {
+            Some(value) => unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", value) },
+            None => unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") },
+        }
     }
 
     // ---- G3: CLI-supplied provider + fields flow through /api/remote/start ----
@@ -2197,7 +2686,8 @@ mod gate_tests {
     async fn g3_start_forwards_cli_provider_and_fields_to_control() {
         let recorder = RecordingControl::default();
         let control = control_router(Some(Arc::new(recorder.clone()) as Arc<dyn RemoteControl>));
-        let body = r#"{"provider":"cloudflared","fields":{"public_url":"https://demo.example.test"}}"#;
+        let body =
+            r#"{"provider":"cloudflared","fields":{"public_url":"https://demo.example.test"}}"#;
         let resp = control
             .oneshot(
                 HttpRequest::builder()
@@ -2212,7 +2702,12 @@ mod gate_tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         // The handler parsed the body and forwarded it verbatim to the control.
-        let recorded = recorder.last_start.lock().unwrap().clone().expect("started");
+        let recorded = recorder
+            .last_start
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("started");
         assert_eq!(recorded.provider.as_deref(), Some("cloudflared"));
         assert_eq!(
             recorded.fields.get("public_url").map(String::as_str),
@@ -2238,7 +2733,12 @@ mod gate_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let recorded = recorder.last_start.lock().unwrap().clone().expect("started");
+        let recorded = recorder
+            .last_start
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("started");
         assert!(
             recorded.is_empty(),
             "empty body must yield empty params (configured fallback)"
@@ -2252,7 +2752,9 @@ mod gate_tests {
             .oneshot(
                 HttpRequest::builder()
                     .uri("/api/remote/status")
-                    .extension(ConnectInfo("203.0.113.7:443".parse::<SocketAddr>().unwrap()))
+                    .extension(ConnectInfo(
+                        "203.0.113.7:443".parse::<SocketAddr>().unwrap(),
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2277,7 +2779,10 @@ mod gate_tests {
         let gateway = production
             .split("fn gateway_router")
             .nth(1)
-            .and_then(|rest| rest.split("/// Build the loopback-only control-plane router").next())
+            .and_then(|rest| {
+                rest.split("/// Build the loopback-only control-plane router")
+                    .next()
+            })
             .expect("gateway_router body");
         let control = production
             .split("pub fn control_router")

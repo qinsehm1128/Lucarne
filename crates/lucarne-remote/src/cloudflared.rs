@@ -51,6 +51,9 @@ const FIELD_PUBLIC_URL: &str = "public_url";
 /// (SEC-003). When set it is used verbatim (after the same safety checks);
 /// otherwise the binary is resolved to an absolute path via `$PATH`.
 const FIELD_BINARY_PATH: &str = "binary_path";
+/// Deprecated `remote.cloudflare` config section accepted as a provider-owned
+/// compatibility alias for `remote.providers.cloudflared`.
+const COMPAT_SECTION_CLOUDFLARE: &str = "cloudflare";
 
 /// Bare binary name resolved on `$PATH` when no `binary_path` is configured.
 const CLOUDFLARED_BIN: &str = "cloudflared";
@@ -136,11 +139,8 @@ impl TokenFile {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!(
-            "lucarne-cf-token-{}-{}",
-            std::process::id(),
-            nanos
-        ));
+        let path =
+            std::env::temp_dir().join(format!("lucarne-cf-token-{}-{}", std::process::id(), nanos));
         write_owner_only(&path, token.as_bytes())?;
         Ok(Self { path })
     }
@@ -165,16 +165,29 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> RemoteResult<()> {
         .create_new(true)
         .mode(0o600)
         .open(path)
-        .map_err(|e| spawn_err(format!("could not create token file {}: {e}", path.display())))?;
-    file.write_all(bytes)
-        .map_err(|e| spawn_err(format!("could not write token file {}: {e}", path.display())))?;
+        .map_err(|e| {
+            spawn_err(format!(
+                "could not create token file {}: {e}",
+                path.display()
+            ))
+        })?;
+    file.write_all(bytes).map_err(|e| {
+        spawn_err(format!(
+            "could not write token file {}: {e}",
+            path.display()
+        ))
+    })?;
     Ok(())
 }
 
 #[cfg(not(unix))]
 fn write_owner_only(path: &Path, bytes: &[u8]) -> RemoteResult<()> {
-    std::fs::write(path, bytes)
-        .map_err(|e| spawn_err(format!("could not write token file {}: {e}", path.display())))
+    std::fs::write(path, bytes).map_err(|e| {
+        spawn_err(format!(
+            "could not write token file {}: {e}",
+            path.display()
+        ))
+    })
 }
 
 impl Cloudflared {
@@ -396,6 +409,10 @@ impl RemoteAccessProvider for Cloudflared {
         REQUIRED_FIELDS
     }
 
+    fn compat_config_sections(&self) -> &[&'static str] {
+        &[COMPAT_SECTION_CLOUDFLARE]
+    }
+
     /// H6a: warn when running a *quick* tunnel (no `token`). A quick tunnel
     /// terminates TLS at the Cloudflare edge, so terminal content is visible in
     /// plaintext there. The daemon logs this (it does NOT special-case the
@@ -446,11 +463,7 @@ impl RemoteAccessProvider for Cloudflared {
         Ok(())
     }
 
-    async fn start(
-        &self,
-        local: SocketAddr,
-        cfg: &ProviderConfig,
-    ) -> RemoteResult<TunnelHandle> {
+    async fn start(&self, local: SocketAddr, cfg: &ProviderConfig) -> RemoteResult<TunnelHandle> {
         // Mode is decided by the presence of a non-empty token field. Validate
         // the per-mode config (e.g. named-tunnel `public_url`) BEFORE resolving
         // or spawning the binary, so a config error is reported without touching
@@ -488,7 +501,11 @@ impl RemoteAccessProvider for Cloudflared {
             Some(tf) => {
                 // Named tunnel: fixed domain, public URL comes from config; token
                 // is read from the 0600 file (kept off argv — L3).
-                command.arg("tunnel").arg("run").arg("--token-file").arg(&tf.path);
+                command
+                    .arg("tunnel")
+                    .arg("run")
+                    .arg("--token-file")
+                    .arg(&tf.path);
             }
             None => {
                 // Quick tunnel: random trycloudflare.com domain parsed from stderr.
@@ -509,19 +526,18 @@ impl RemoteAccessProvider for Cloudflared {
         // the first URL via a oneshot, then keeps reading so the pipe never
         // fills and back-pressures / blocks cloudflared).
         let quick_mode = named_public_url.is_none();
-        command.stdout(std::process::Stdio::null()).kill_on_drop(true);
+        command
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(true);
         if quick_mode {
             command.stderr(std::process::Stdio::piped());
         } else {
             command.stderr(std::process::Stdio::null());
         }
 
-        let mut child = command.spawn().map_err(|err| {
-            spawn_err(format!(
-                "could not launch `{}`: {err}",
-                binary.display()
-            ))
-        })?;
+        let mut child = command
+            .spawn()
+            .map_err(|err| spawn_err(format!("could not launch `{}`: {err}", binary.display())))?;
 
         let public_url = match named_public_url {
             Some(url) => url,
@@ -748,16 +764,25 @@ mod tests {
         // token + public_url + binary_path (M7 added the conditional public_url;
         // SEC-003 added binary_path).
         assert_eq!(fields.len(), 3);
-        let token = fields.iter().find(|f| f.key == "token").expect("token field");
+        let token = fields
+            .iter()
+            .find(|f| f.key == "token")
+            .expect("token field");
         assert!(token.secret, "token must be masked");
         assert!(!token.required, "token is optional (quick is default)");
-        assert!(token.required_when.is_none(), "token itself is unconditional");
+        assert!(
+            token.required_when.is_none(),
+            "token itself is unconditional"
+        );
         // M7: public_url is conditionally required only when a token is set.
         let public_url = fields
             .iter()
             .find(|f| f.key == "public_url")
             .expect("public_url field");
-        assert!(!public_url.required, "public_url is not unconditionally required");
+        assert!(
+            !public_url.required,
+            "public_url is not unconditionally required"
+        );
         assert_eq!(
             public_url.required_when,
             Some(("token", crate::ANY_VALUE)),
@@ -767,7 +792,10 @@ mod tests {
             .iter()
             .find(|f| f.key == "binary_path")
             .expect("binary_path field");
-        assert!(!bin.required, "binary_path is optional (PATH resolution default)");
+        assert!(
+            !bin.required,
+            "binary_path is optional (PATH resolution default)"
+        );
         assert!(!bin.secret, "binary_path is not a secret");
     }
 
@@ -797,8 +825,10 @@ mod tests {
 
         // Named tunnel with a valid public_url → ok.
         let mut good = named.clone();
-        good.fields
-            .insert("public_url".to_string(), "https://term.example.com".to_string());
+        good.fields.insert(
+            "public_url".to_string(),
+            "https://term.example.com".to_string(),
+        );
         assert!(provider.validate_config(&good).is_ok());
     }
 
@@ -832,7 +862,10 @@ mod tests {
         named
             .fields
             .insert("token".to_string(), "eyJhbGc...".to_string());
-        assert!(provider.warnings(&named).is_empty(), "named tunnel must not warn");
+        assert!(
+            provider.warnings(&named).is_empty(),
+            "named tunnel must not warn"
+        );
     }
 
     // H6b: cloudflared advertises `cf-connecting-ip` as its trusted forwarded
@@ -841,6 +874,12 @@ mod tests {
     fn cloudflared_advertises_cf_connecting_ip_forwarded_header() {
         let provider = Cloudflared::new();
         assert_eq!(provider.forwarded_identity_headers(), &["cf-connecting-ip"]);
+    }
+
+    #[test]
+    fn cloudflared_declares_legacy_config_section_alias() {
+        let provider = Cloudflared::new();
+        assert_eq!(provider.compat_config_sections(), &["cloudflare"]);
     }
 
     #[test]
@@ -899,7 +938,10 @@ mod tests {
         // A real (named-tunnel) token file on disk, tied to the child's lifetime.
         let token_file = TokenFile::write("secret-named-tunnel-token").expect("token file");
         let token_path = token_file.path.clone();
-        assert!(token_path.exists(), "token file exists while the tunnel is tracked");
+        assert!(
+            token_path.exists(),
+            "token file exists while the tunnel is tracked"
+        );
 
         // A short-lived child that exits immediately (stands in for cloudflared
         // crashing). `true` exits 0 on every supported platform.
@@ -913,7 +955,11 @@ mod tests {
         let _ = child.wait().await;
 
         let handle = provider.insert_for_test(child, Some(token_file));
-        assert_eq!(provider.tracked_children(), 1, "child tracked before health");
+        assert_eq!(
+            provider.tracked_children(),
+            1,
+            "child tracked before health"
+        );
 
         // Health observes the exit → Down, AND reaps the entry.
         assert_eq!(provider.health(&handle).await.unwrap(), TunnelStatus::Down);
@@ -982,7 +1028,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn world_writable_binary_directory_is_refused() {        use std::os::unix::fs::PermissionsExt;
+    fn world_writable_binary_directory_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir");
         // Make the directory world-writable (o+w).
         let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();

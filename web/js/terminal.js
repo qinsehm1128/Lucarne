@@ -148,10 +148,16 @@ export function initTerminal({ onAgent, onSelect } = {}) {
     ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right",
     Home: "home", End: "end", PageUp: "page_up", PageDown: "page_down", Delete: "delete",
   };
+  function mods(e) {
+    return { ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey };
+  }
   function keyToInput(e) {
     const key = e.key;
     if (e.ctrlKey && key.length === 1 && /[a-zA-Z]/.test(key)) {
       return { kind: "control", key: { ctrl_char: key.toLowerCase() } };
+    }
+    if (e.altKey || e.metaKey || (e.shiftKey && NAMED[key])) {
+      return { kind: "key", code: key, mods: mods(e) };
     }
     if (NAMED[key]) return { kind: "control", key: NAMED[key] };
     if (key.length === 1 && !e.metaKey) return { kind: "text", text: key };

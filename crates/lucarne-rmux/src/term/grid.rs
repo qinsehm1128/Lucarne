@@ -1,8 +1,5 @@
 //! Terminal grid value types — the single vocabulary for the mirror wire.
 //!
-//! Ported from the rmux_remote_control `shared-protocol` crate (terminal subset
-//! only — the chat/agent types are intentionally dropped: under the monitor
-//! model, agent chat is Lucarne's own runtime, not this terminal subsystem).
 //! Field shapes are verbatim from the rmux-sdk 0.3.1 probe:
 //! - `Cell.text: String` (a grapheme cluster), not `ch: char` — preserves CJK /
 //!   emoji / non-BMP. `width: u8` + `padding: bool` carried from rmux so the
@@ -78,7 +75,6 @@ pub enum Color {
     /// Forward-compat fallback for unknown/future raw encodings.
     Encoded(i32),
 }
-
 
 bitflags::bitflags! {
     /// Cell style attributes. Bit values are aligned to `rmux_sdk::PaneAttributes`

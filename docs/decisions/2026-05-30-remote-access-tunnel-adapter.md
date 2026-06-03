@@ -20,9 +20,13 @@ hardened authentication story that is correct by default.
 
 ## Decision
 
-Add a pluggable **remote-access tunnel adapter** as a new rmux-free crate
-`lucarne-remote`, wired into `lucarned` behind an optional `remote` cargo
-feature. The design is captured as nine locked decisions (L1–L9).
+Add a pluggable **remote-access tunnel adapter** as a rmux-free crate
+`lucarne-remote`, wired into `lucarned` behind explicit capability features.
+The source default build remains the base daemon. The `remote-access` feature
+adds the tunnel provider abstraction, while `terminal-gateway` selects the
+terminal gateway as the exposed capability and `product-terminal` is the release
+bundle. `remote.enabled` controls autostart behavior after that capability is
+built. The design is captured as nine locked decisions (L1–L9).
 
 ### L1 — Adapter abstraction mirrors `AdapterPlugin`/`AdapterRegistry`
 
@@ -76,12 +80,13 @@ fixed runtime constants, not file-config fields.
 
 ### L6 — daemon owns the tunnel lifecycle; CLI is a thin loopback control client
 
-`lucarned` (behind the `remote` feature) owns the tunnel so it survives CLI exit
-and shuts down with the daemon, mirroring the health subsystem wiring. `termctl`
-gains a thin `go-public` subcommand that drives the daemon over a loopback-only
-control API (`POST /api/remote/start`, etc.) and renders the returned public URL +
-credentials (QR via the existing `qrcode` crate). Lifecycle ownership is
-unambiguous and the control plane stays on loopback.
+`lucarned` owns the tunnel so it survives CLI exit and shuts down with the
+daemon, mirroring the health subsystem wiring. `lucarned remote
+start|stop|status` is a thin headless loopback control client, and `lucarned
+tui` provides the interactive Go Public panel. Both drive the daemon over a
+loopback-only control API (`POST /api/remote/start`, etc.) and render the
+returned public URL + credentials (QR via the existing `qrcode` crate).
+Lifecycle ownership is unambiguous and the control plane stays on loopback.
 
 ### L7 — Reserved backends are trait seams only
 
@@ -93,10 +98,10 @@ through `RemoteRegistry` with zero changes to the core.
 
 ### L8 — Engineering discipline per AGENTS.md
 
-Nightly toolchain with `cargo -Zbuild-dir-new-layout`; the capability is a new
-feature-gated crate so default builds never pull it; this ADR records the
-decision; provider-specific logic stays in the provider module and does not
-pollute common/core layers.
+Nightly toolchain with `cargo -Zbuild-dir-new-layout`; provider-specific logic
+stays in the provider module and does not pollute common/core layers. The remote
+provider seam remains isolated, while the user-facing remote/TUI/gateway entry
+is directly fused into the default `lucarned` product build.
 
 ### L9 — Definition of done includes real-device reachability
 
@@ -122,19 +127,21 @@ resist replay and brute force.
 
 ## Consequences
 
-- `lucarned` gains an optional `remote` feature that owns the tunnel lifecycle;
-  default and `--no-default-features` builds are unaffected and never pull the
-  tunnel stack.
+- The default source `lucarned` build stays a base daemon and does not link
+  `lucarne-remote`, `lucarne-termgw`, or `lucarne-rmux`. Release packaging opts
+  into the `product-terminal` bundle so installed users still get the terminal
+  remote-access product in the single `lucarned` binary.
 - `lucarned.yaml` gains a `remote:` section
-  (`enabled`/`provider`/`gateway_addr`/`auth_token`/`insecure`) plus a GENERIC,
+  (`enabled` as autostart, `provider`, `gateway_addr`, `control_addr`,
+  `auth_token`, `readonly_token`, `insecure`) plus a GENERIC,
   transport-agnostic `providers:` map keyed by provider id — e.g.
   `providers: { cloudflared: { token, public_url, binary_path } }` (H6c). The
   daemon passes the selected provider's field map straight through to the
   provider without interpreting any field name, so a new backend is purely a
-  `providers.<id>` block. The legacy typed `remote.cloudflare:` sub-map is still
-  accepted for backward compatibility (merged under `providers.cloudflared`, the
-  generic map winning per key) plus commented reserved-backend placeholders
-  (`frp`/`relay`) pointing here.
+  `providers.<id>` block. Deprecated compatibility sections such as
+  `remote.cloudflare:` are provider-declared aliases, not daemon-owned concrete
+  structs; they are merged before `providers.<id>` so the generic map wins per
+  key. Commented reserved-backend placeholders (`frp`/`relay`) point here.
 - Providers self-describe their config rules through the trait, not the daemon:
   `RequiredField::required_when` expresses a conditional requirement (e.g.
   cloudflared's `public_url` is required-when a named-tunnel `token` is set —
@@ -147,8 +154,9 @@ resist replay and brute force.
   is not visible in the process command line (`ps` / `/proc/<pid>/cmdline`) —
   L3. It remains readable by the same local user while the tunnel runs (a
   same-user attacker is already inside the daemon's trust boundary).
-- The web client and `termgw` gain an auth layer (Bearer + ticket exchange); the
-  CLI gains a `go-public` command over the loopback control API.
+- The web client and `termgw` gain an auth layer (Bearer + ticket exchange);
+  `lucarned remote` and the `lucarned tui` Go Public panel drive the loopback
+  control API.
 - Adding FRP / relay / other tunnels later is a localized change: one
   `RemoteAccessProvider` impl + one registry registration + a `providers.<id>`
   config block — no daemon-config or common-layer change.
@@ -161,7 +169,7 @@ resist replay and brute force.
   relies on CF edge TLS. Operators must understand the CF edge is in the trust
   path. (SEC-012) The daemon emits a loud `tracing::warn!` whenever a *quick*
   tunnel (no `token`) starts, recommending a **named tunnel**
-  (`remote.cloudflare.token` + `public_url`) for sensitive sessions.
+  (`remote.providers.cloudflared.token` + `public_url`) for sensitive sessions.
 - **Single shared access token.** The full-access token is shared, not per-user
   or per-session. A second, optional **read-only** credential
   (`remote.readonly_token`, SEC-013) is supported: its ws sessions may mirror

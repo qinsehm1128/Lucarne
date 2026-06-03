@@ -125,8 +125,8 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
         .unwrap_or_else(|| "selected: (none)".to_string());
     let status = panel.status.clone().unwrap_or_default();
     let footer_body = format!("{selected}\n{status}");
-    let footer_widget = Paragraph::new(footer_body)
-        .block(Block::default().borders(Borders::ALL).title("status"));
+    let footer_widget =
+        Paragraph::new(footer_body).block(Block::default().borders(Borders::ALL).title("status"));
     frame.render_widget(footer_widget, footer);
 }
 
@@ -158,11 +158,18 @@ fn draw_go_public(frame: &mut Frame, app: &mut App, area: Rect) {
         .as_ref()
         .and_then(|s| s.public_url.as_deref())
         .unwrap_or("(none)");
-    let token = match panel.status.as_ref().and_then(|s| s.access_token.as_deref()) {
+    let token = match panel
+        .status
+        .as_ref()
+        .and_then(|s| s.access_token.as_deref())
+    {
         Some(t) if !t.is_empty() => "set (hidden — open the QR to share)",
         _ => "(none)",
     };
-    let message = panel.message.as_deref().unwrap_or("press r to fetch status");
+    let message = panel
+        .message
+        .as_deref()
+        .unwrap_or("press r to fetch status");
 
     let body = format!(
         "Remote access: {state}\n\
@@ -213,9 +220,13 @@ fn draw_config(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|row| {
             let (label, value) = match row {
+                Row::Enabled => ("autostart".to_string(), panel.row_display(row)),
                 Row::Provider => ("provider".to_string(), panel.row_display(row)),
                 Row::GatewayPort => ("gateway port".to_string(), panel.row_display(row)),
                 Row::ControlPort => ("control port".to_string(), panel.row_display(row)),
+                Row::AuthToken => ("auth token".to_string(), panel.row_display(row)),
+                Row::ReadonlyToken => ("read-only token".to_string(), panel.row_display(row)),
+                Row::Insecure => ("insecure".to_string(), panel.row_display(row)),
                 Row::Field {
                     label, required, ..
                 } => {
@@ -238,11 +249,8 @@ fn draw_config(frame: &mut Frame, app: &mut App, area: Rect) {
     let footer_body = match &panel.editing {
         Some(buf) => {
             let secret = matches!(
-                panel
-                    .list
-                    .selected()
-                    .and_then(|i| panel.rows.get(i)),
-                Some(Row::Field { secret: true, .. })
+                panel.list.selected().and_then(|i| panel.rows.get(i)),
+                Some(Row::AuthToken | Row::ReadonlyToken | Row::Field { secret: true, .. })
             );
             let shown = if secret {
                 "•".repeat(buf.chars().count())
@@ -253,8 +261,8 @@ fn draw_config(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         None => panel.status.clone().unwrap_or_default(),
     };
-    let footer_widget = Paragraph::new(footer_body)
-        .block(Block::default().borders(Borders::ALL).title("status"));
+    let footer_widget =
+        Paragraph::new(footer_body).block(Block::default().borders(Borders::ALL).title("status"));
     frame.render_widget(footer_widget, footer);
 }
 

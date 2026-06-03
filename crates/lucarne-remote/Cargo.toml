@@ -18,3 +18,6 @@ url = "2"
 # SEC-003 binary-pinning tests: create vetted / world-writable temp dirs to
 # exercise `resolve_cloudflared_binary` without a real cloudflared install.
 tempfile = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

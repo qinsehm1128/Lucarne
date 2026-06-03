@@ -1,6 +1,5 @@
-//! Go-Public panel backend — the tunnel-control-plane helpers migrated verbatim
-//! from the old `lucarne-termctl` `term go-public` flow (Decision 2:
-//! migrate-don't-rewrite). The TUI stays a thin wrapper (Locked decision L6): it
+//! Go-Public panel backend — the tunnel-control-plane helpers now share the
+//! `lucarned remote start` control path. The TUI stays a thin wrapper (Locked decision L6): it
 //! never spawns a tunnel itself. It picks a built-in provider, collects that
 //! provider's required fields (see [`crate::tui::config`]), then drives the
 //! daemon's loopback-only control plane (`POST /api/remote/start`) so the daemon
@@ -139,7 +138,10 @@ pub fn call_remote_start(
         "fields": plan.fields,
     });
     let client = reqwest::blocking::Client::new();
-    send_control(client.post(&plan.control_url).json(&body), &plan.control_url)
+    send_control(
+        client.post(&plan.control_url).json(&body),
+        &plan.control_url,
+    )
 }
 
 /// The loopback control URL for one `/api/remote/<verb>` route on `control_port`.
@@ -338,7 +340,11 @@ impl GoPublicPanel {
                 self.status = Some(status);
             }
             Err(e) => {
-                self.message = Some(explain_control_error("status failed", self.control_port, &e));
+                self.message = Some(explain_control_error(
+                    "status failed",
+                    self.control_port,
+                    &e,
+                ));
             }
         }
     }
@@ -506,7 +512,9 @@ pub fn render_qr_modal(frame: &mut Frame, panel: &GoPublicPanel, area: Rect) {
 
             if grid.fits_within(inner) {
                 let lines: Vec<Line> = qr.lines().map(|l| Line::styled(l, qr_style)).collect();
-                let qr_widget = Paragraph::new(Text::from(lines)).block(block).style(qr_style);
+                let qr_widget = Paragraph::new(Text::from(lines))
+                    .block(block)
+                    .style(qr_style);
                 frame.render_widget(qr_widget, modal);
             } else {
                 render_qr_fallback(frame, &login, area, block);
@@ -631,7 +639,11 @@ mod go_public_tests {
 
     // ---- TASK-003: Go-Public panel pure logic ----
 
-    fn status(running: bool, url: Option<&str>, token: Option<&str>) -> lucarne_remote_status::RemoteStartStatus {
+    fn status(
+        running: bool,
+        url: Option<&str>,
+        token: Option<&str>,
+    ) -> lucarne_remote_status::RemoteStartStatus {
         lucarne_remote_status::RemoteStartStatus {
             running,
             provider: Some("cloudflared".to_string()),
@@ -666,7 +678,11 @@ mod go_public_tests {
         // No status yet → no login string.
         assert!(panel.login().is_none());
         // Running with a URL + token → the `#token=` fragment login (reusing login_url).
-        panel.status = Some(status(true, Some("https://demo.example.test"), Some("secret")));
+        panel.status = Some(status(
+            true,
+            Some("https://demo.example.test"),
+            Some("secret"),
+        ));
         assert_eq!(
             panel.login().as_deref(),
             Some("https://demo.example.test#token=secret")

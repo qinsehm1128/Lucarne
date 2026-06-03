@@ -42,14 +42,13 @@ pub const LOCKOUT: Duration = Duration::from_secs(60);
 /// Hard cap on outstanding (issued, not-yet-consumed/expired) ws tickets the
 /// [`TicketStore`] holds at once (M3). A bearer is already authenticated before
 /// it can mint a ticket, so this only bounds churn from a misbehaving/compromised
-/// authenticated client; over the cap the oldest ticket is evicted so a fresh
-/// `issue` always succeeds without the map growing without bound.
+/// authenticated client; over the cap new ticket issuance is refused so existing
+/// fresh tickets are never invalidated by a mint flood.
 pub const MAX_OUTSTANDING_TICKETS: usize = 1024;
 
 /// Max ws tickets minted per [`TICKET_RATE_WINDOW`] across the store (M3). A
-/// run of `issue` calls beyond this within the window is throttled: the oldest
-/// outstanding ticket is evicted before the new one is recorded so the
-/// outstanding set cannot be inflated faster than tickets naturally expire.
+/// run of `issue` calls beyond this within the window is throttled by refusing
+/// new tickets. Existing tickets remain valid until consumed or expired.
 pub const MAX_TICKETS_PER_WINDOW: u32 = 256;
 /// Rolling window for the [`MAX_TICKETS_PER_WINDOW`] issue-rate accounting.
 pub const TICKET_RATE_WINDOW: Duration = Duration::from_secs(1);
@@ -87,8 +86,7 @@ fn random_secret() -> String {
 /// single encode and keeps the secret safe to place in headers and ws query
 /// strings.
 fn base64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -216,9 +214,9 @@ impl AccessToken {
 /// and the mint rate by [`MAX_TICKETS_PER_WINDOW`] per [`TICKET_RATE_WINDOW`].
 /// `issue_scoped` is a fast path — it does NOT scan the whole map on every call;
 /// expiry is lazy (`consume_scoped` rejects an expired entry) plus an
-/// opportunistic sweep that runs ONLY when the map is near the cap. Over the cap,
-/// the oldest outstanding ticket is evicted in O(1)-amortized via a FIFO of
-/// issue order, so a legitimate new `issue` always succeeds.
+/// opportunistic front-prune that runs ONLY when the map is near the cap. Over
+/// the cap or rate window, issuance returns [`TicketIssueError`] instead of
+/// evicting unrelated fresh tickets.
 #[derive(Clone)]
 pub struct TicketStore {
     ttl: Duration,
@@ -242,6 +240,26 @@ struct TicketStoreInner {
     window_start: Instant,
     window_count: u32,
 }
+
+/// Ticket issuance refusal reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketIssueError {
+    /// Too many not-yet-consumed/unexpired tickets are already outstanding.
+    OutstandingLimit,
+    /// Too many tickets were issued in the current rate window.
+    RateLimited,
+}
+
+impl std::fmt::Display for TicketIssueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TicketIssueError::OutstandingLimit => write!(f, "too many outstanding tickets"),
+            TicketIssueError::RateLimited => write!(f, "ticket issuance rate limit exceeded"),
+        }
+    }
+}
+
+impl std::error::Error for TicketIssueError {}
 
 /// The access scope a credential (and the ws ticket minted from it) grants.
 ///
@@ -311,48 +329,39 @@ impl TicketStore {
         }
     }
 
-    /// Mint a new single-use full-access ticket valid for the store TTL. Returns
-    /// the ticket string (CSPRNG, url-safe) to hand to the client.
-    pub async fn issue(&self) -> String {
+    /// Mint a new single-use full-access ticket valid for the store TTL.
+    pub async fn issue(&self) -> Result<String, TicketIssueError> {
         self.issue_scoped(AccessScope::Full).await
     }
 
     /// Mint a new single-use ticket carrying `scope` (SEC-013). A `ReadOnly`
     /// ticket later consumes to a read-only ws session.
     ///
-    /// M3: a fast path — no full-map scan. It updates the issue-rate window, and
-    /// when at/over the rate cap OR the outstanding cap it evicts the oldest
-    /// outstanding ticket (FIFO) so the new one is always recordable without the
-    /// set growing without bound.
-    pub async fn issue_scoped(&self, scope: AccessScope) -> String {
-        let ticket = random_secret();
+    /// M3: a fast path — no full-map scan. It updates the issue-rate window and
+    /// refuses issuance when at the outstanding cap or over the rate cap. It only
+    /// prunes stale/expired FIFO heads, never an unrelated fresh live ticket.
+    pub async fn issue_scoped(&self, scope: AccessScope) -> Result<String, TicketIssueError> {
         let now = Instant::now();
         let mut inner = self.inner.lock().await;
+
+        if inner.entries.len() >= self.max_outstanding {
+            inner.prune_expired_and_stale_front(self.ttl, now);
+        }
+        if inner.entries.len() >= self.max_outstanding {
+            return Err(TicketIssueError::OutstandingLimit);
+        }
 
         // M3 issue-rate window accounting.
         if now.duration_since(inner.window_start) >= self.rate_window {
             inner.window_start = now;
             inner.window_count = 0;
         }
-        inner.window_count = inner.window_count.saturating_add(1);
-        let over_rate = inner.window_count > self.max_per_window;
-
-        // Evict oldest live tickets while at the outstanding cap or over the rate
-        // cap. Eviction is FIFO and skips stale front entries (already consumed /
-        // expired), so this is O(1) amortized and never scans the whole map.
-        let target = if over_rate {
-            // Under a mint flood, keep strictly below the cap so churn cannot
-            // inflate the outstanding set faster than tickets expire.
-            self.max_outstanding.saturating_sub(1).max(1)
-        } else {
-            self.max_outstanding
-        };
-        while inner.entries.len() >= target {
-            if !inner.evict_oldest(self.ttl, now) {
-                break; // nothing evictable (all fresh + at cap) — still record below
-            }
+        if inner.window_count >= self.max_per_window {
+            return Err(TicketIssueError::RateLimited);
         }
+        inner.window_count = inner.window_count.saturating_add(1);
 
+        let ticket = random_secret();
         let seq = inner.next_seq;
         inner.next_seq = inner.next_seq.wrapping_add(1);
         inner.entries.insert(
@@ -364,7 +373,7 @@ impl TicketStore {
             },
         );
         inner.order.push_back((seq, ticket.clone()));
-        ticket
+        Ok(ticket)
     }
 
     /// Validate and consume `ticket`: `true` iff it existed, was not expired, and
@@ -401,22 +410,19 @@ impl TicketStore {
 }
 
 impl TicketStoreInner {
-    /// Evict the oldest still-live ticket (FIFO), skipping front entries that are
-    /// already consumed (absent from `entries`) or expired. Returns `true` when a
-    /// live ticket was removed, `false` when the FIFO drained without finding one
-    /// (every remaining ticket is fresh and the queue had only stale heads). M3:
-    /// O(1) amortized — each `order` entry is visited at most once total.
-    fn evict_oldest(&mut self, ttl: Duration, now: Instant) -> bool {
+    /// Drop consumed/stale FIFO heads and expired oldest entries. This never
+    /// removes a fresh live ticket; once the oldest live ticket is still within
+    /// TTL, all later live tickets are fresh too.
+    fn prune_expired_and_stale_front(&mut self, ttl: Duration, now: Instant) {
         while let Some((seq, ticket)) = self.order.pop_front() {
             match self.entries.get(&ticket) {
-                // Live entry (matching seq): evict it.
                 Some(entry) if entry.seq == seq => {
                     let expired = now.duration_since(entry.issued) >= ttl;
-                    self.entries.remove(&ticket);
-                    // An expired entry doesn't count as "made room from a live
-                    // ticket"; keep popping so the cap reflects live tickets.
-                    if !expired {
-                        return true;
+                    if expired {
+                        self.entries.remove(&ticket);
+                    } else {
+                        self.order.push_front((seq, ticket));
+                        return;
                     }
                 }
                 // Stale FIFO head (already consumed, or a re-issued key with a
@@ -424,7 +430,6 @@ impl TicketStoreInner {
                 _ => {}
             }
         }
-        false
     }
 }
 
@@ -726,10 +731,7 @@ impl ForwardedIdentityPolicy {
     /// Resolve the forwarded client IP from `lookup` (a `header name → value`
     /// resolver) using the first trusted header that yields a value. Returns
     /// `None` when no trusted header is configured or none is present.
-    pub fn forwarded_ip<'a>(
-        &self,
-        lookup: impl Fn(&str) -> Option<&'a str>,
-    ) -> Option<&'a str> {
+    pub fn forwarded_ip<'a>(&self, lookup: impl Fn(&str) -> Option<&'a str>) -> Option<&'a str> {
         self.trusted_headers
             .iter()
             .find_map(|name| lookup(name.as_str()))
@@ -977,7 +979,7 @@ mod tests {
     #[tokio::test]
     async fn ticket_is_single_use() {
         let store = TicketStore::default();
-        let ticket = store.issue().await;
+        let ticket = store.issue().await.expect("issue ticket");
         assert!(store.consume(&ticket).await, "first consume must succeed");
         assert!(
             !store.consume(&ticket).await,
@@ -991,7 +993,7 @@ mod tests {
     async fn ticket_expires_after_ttl() {
         // Tiny TTL so the test is fast and deterministic.
         let store = TicketStore::new(Duration::from_millis(20));
-        let ticket = store.issue().await;
+        let ticket = store.issue().await.expect("issue ticket");
         tokio::time::sleep(Duration::from_millis(40)).await;
         assert!(
             !store.consume(&ticket).await,
@@ -1004,10 +1006,13 @@ mod tests {
     #[tokio::test]
     async fn ticket_carries_scope_through_consume() {
         let store = TicketStore::default();
-        let full = store.issue().await; // == issue_scoped(Full)
+        let full = store.issue().await.expect("issue ticket"); // == issue_scoped(Full)
         assert_eq!(store.consume_scoped(&full).await, Some(AccessScope::Full));
 
-        let ro = store.issue_scoped(AccessScope::ReadOnly).await;
+        let ro = store
+            .issue_scoped(AccessScope::ReadOnly)
+            .await
+            .expect("issue read-only ticket");
         assert_eq!(store.consume_scoped(&ro).await, Some(AccessScope::ReadOnly));
         // Single-use still holds for scoped tickets.
         assert_eq!(store.consume_scoped(&ro).await, None);
@@ -1016,49 +1021,59 @@ mod tests {
         assert_eq!(store.consume_scoped("never-issued").await, None);
     }
 
-    // M3: the outstanding ticket set is hard-capped — minting beyond the cap
-    // evicts the OLDEST outstanding ticket (so a fresh issue always works) and
-    // never grows past the cap. Issuing does NOT scan/sweep the whole map.
+    // M3: the outstanding ticket set is hard-capped. Minting beyond the cap is
+    // refused and never evicts another client's still-fresh ticket.
     #[tokio::test]
-    async fn ticket_store_caps_outstanding_and_evicts_oldest() {
+    async fn ticket_store_caps_outstanding_without_evicting_fresh_tickets() {
         // Long TTL (nothing self-expires), small cap, generous rate so the rate
         // path doesn't interfere with the pure-cap assertion.
-        let store = TicketStore::with_limits(Duration::from_secs(3600), 3, 1000, Duration::from_secs(1));
-        let t1 = store.issue().await;
-        let t2 = store.issue().await;
-        let t3 = store.issue().await;
+        let store =
+            TicketStore::with_limits(Duration::from_secs(3600), 3, 1000, Duration::from_secs(1));
+        let t1 = store.issue().await.expect("issue ticket");
+        let t2 = store.issue().await.expect("issue ticket");
+        let t3 = store.issue().await.expect("issue ticket");
         assert_eq!(store.outstanding().await, 3, "at cap");
-        // A 4th mint evicts the oldest (t1) to stay at the cap.
-        let t4 = store.issue().await;
-        assert_eq!(store.outstanding().await, 3, "still at cap after eviction");
-        // t1 was evicted → no longer consumable; t2..t4 survive.
-        assert!(!store.consume(&t1).await, "oldest ticket must be evicted");
+        // A 4th mint is refused instead of evicting the oldest fresh ticket.
+        assert_eq!(
+            store.issue().await.expect_err("cap must reject new ticket"),
+            TicketIssueError::OutstandingLimit
+        );
+        assert_eq!(store.outstanding().await, 3, "still at cap after refusal");
+        // All previously issued fresh tickets survive the mint flood.
+        assert!(store.consume(&t1).await);
         assert!(store.consume(&t2).await);
         assert!(store.consume(&t3).await);
-        assert!(store.consume(&t4).await);
     }
 
-    // M3: the issue-rate cap throttles a mint flood by keeping the outstanding
-    // set strictly bounded — a burst far beyond the rate window cannot inflate
-    // the map past the cap.
+    // M3: the issue-rate cap rejects a mint flood without evicting previously
+    // issued fresh tickets.
     #[tokio::test]
-    async fn ticket_store_rate_cap_bounds_outstanding_under_flood() {
+    async fn ticket_store_rate_cap_refuses_flood_without_evicting_fresh_tickets() {
         let cap = 8;
         let store = TicketStore::with_limits(
             Duration::from_secs(3600),
             cap,
-            4, // 4 mints per window
+            4,                         // 4 mints per window
             Duration::from_secs(3600), // window won't roll during the test
         );
-        // Mint far more than the rate cap within one window.
-        for _ in 0..200 {
-            let _ = store.issue().await;
+        let mut issued = Vec::new();
+        for _ in 0..4 {
+            issued.push(store.issue().await.expect("issue ticket"));
         }
-        // The outstanding set never exceeds the hard cap.
-        assert!(
-            store.outstanding().await <= cap,
-            "outstanding tickets must stay within the cap under a mint flood"
+        assert_eq!(
+            store
+                .issue()
+                .await
+                .expect_err("rate cap must reject new ticket"),
+            TicketIssueError::RateLimited
         );
+        assert_eq!(store.outstanding().await, 4);
+        for ticket in issued {
+            assert!(
+                store.consume(&ticket).await,
+                "fresh ticket must survive rate refusal"
+            );
+        }
     }
 
     // M3: expiry is enforced lazily on consume even though issue does not sweep.
@@ -1070,9 +1085,12 @@ mod tests {
             1000,
             Duration::from_secs(1),
         );
-        let ticket = store.issue().await;
+        let ticket = store.issue().await.expect("issue ticket");
         tokio::time::sleep(Duration::from_millis(40)).await;
-        assert!(!store.consume(&ticket).await, "expired ticket must not consume");
+        assert!(
+            !store.consume(&ticket).await,
+            "expired ticket must not consume"
+        );
     }
 
     // SEC-013: the readonly token authenticates as ReadOnly; the full token as
@@ -1166,7 +1184,10 @@ mod tests {
         // A fourth distinct key must evict the oldest ("a") to stay at the cap.
         limiter.record_failure("d", true).await;
         assert_eq!(limiter.entry_count().await, 3);
-        assert!(!limiter.has_entry("a").await, "oldest entry must be evicted");
+        assert!(
+            !limiter.has_entry("a").await,
+            "oldest entry must be evicted"
+        );
         assert!(limiter.has_entry("d").await, "newest entry must be present");
     }
 
@@ -1205,13 +1226,19 @@ mod tests {
         // A third distinct key cannot be tracked (no victim) → not locked, and
         // the map does NOT grow past the cap.
         let locked_new = limiter.record_failure("c", true).await;
-        assert!(!locked_new, "a new key under a full all-locked cap is not locked");
+        assert!(
+            !locked_new,
+            "a new key under a full all-locked cap is not locked"
+        );
         assert_eq!(
             limiter.entry_count().await,
             2,
             "hard cap: the map must not exceed max_entries even under flood"
         );
-        assert!(!limiter.has_entry("c").await, "new key was refused tracking (M4)");
+        assert!(
+            !limiter.has_entry("c").await,
+            "new key was refused tracking (M4)"
+        );
         // The existing live hard-locks are untouched.
         assert!(limiter.is_locked("a").await);
         assert!(limiter.is_locked("b").await);

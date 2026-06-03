@@ -14,20 +14,18 @@ mirrored rmux sessions and the public-access tunnel.
 
 ## Build & launch
 
-The TUI is gated behind the `tui` cargo feature (which implies `remote`). It pulls
-in `ratatui` + `crossterm`; the **default `lucarned` build links none of them** and
-stays a pure structured-message bridge (guarded by `tests/default_build_purity.rs`).
+The TUI is part of the explicit `lucarned` terminal product bundle
+(`product-terminal`). The default source build stays a minimal base daemon;
+release packaging enables the bundle so the shipped daemon binary includes the
+TUI, remote control plane, terminal gateway, and rmux live binding.
 
 ```bash
-# from a release/feature build
+# from a release build
 lucarned tui
 
 # from source (AGENTS.md build discipline: nightly + new build-dir layout)
-cargo +nightly run -Zbuild-dir-new-layout -p lucarned --features tui -- tui
+cargo +nightly run -Zbuild-dir-new-layout -p lucarned --features product-terminal -- tui
 ```
-
-Running `lucarned tui` without the `tui` feature prints a clear "rebuild with
-`--features tui`" error.
 
 ---
 
@@ -108,16 +106,33 @@ Drives the daemon's loopback control plane (`/api/remote/{start,stop,status}` on
 > Actually opening a tunnel also needs `cloudflared` installed/configured (see the
 > `remote:` section of `lucarned.yaml`).
 
+Cloudflare Quick Tunnel is the zero-config testing/development path used when
+the Cloudflared token is blank. It creates an ephemeral `trycloudflare.com`
+hostname and should not be treated as production availability. For sensitive or
+repeatable access, configure a named tunnel with `token` and `public_url`.
+
 End-to-end (two terminals):
 
 ```bash
-# Terminal A — run the daemon (a --features tui build implies remote and serves
-# the loopback control plane from boot; the tunnel starts lazily on `s`)
-cargo +nightly run -Zbuild-dir-new-layout -p lucarned --features tui
+# Terminal A — run the daemon. It serves the loopback control plane from boot;
+# the tunnel starts lazily when the TUI sends start.
+cargo +nightly run -Zbuild-dir-new-layout -p lucarned
 
 # Terminal B — open the TUI, go to "Go Public", press `s`
-cargo +nightly run -Zbuild-dir-new-layout -p lucarned --features tui -- tui
+cargo +nightly run -Zbuild-dir-new-layout -p lucarned -- tui
 ```
+
+Release smoke checklist for public access:
+
+```bash
+cargo +nightly build -Zbuild-dir-new-layout -p lucarned
+LUCARNE_QUICK_TUNNEL_E2E=1 scripts/remote-quick-tunnel-e2e.sh
+```
+
+The harness is env-gated and skips by default. When enabled, it starts a
+temporary daemon, opens a Quick Tunnel, verifies public auth/read-only/router
+isolation through the `trycloudflare.com` URL, calls `lucarned remote stop`, and
+then tears the daemon down.
 
 ### Config — edit remote-access config
 
@@ -147,8 +162,10 @@ config and backup are created `0o600`. Secret fields are masked on screen.
   terminal content. The full interactive mirror lives in the web terminal view.
 - **Provider boundary (AGENTS.md).** Provider specifics stay behind
   `lucarne_remote` descriptors; the TUI/common layers route opaque ids only.
-- **Feature isolation.** `ratatui`/`crossterm`/`rmux` are compiled only under the
-  `tui` feature; the default daemon build is unaffected.
+- **Explicit capability features.** The source default build keeps
+  `ratatui`/`crossterm`/`lucarne-termgw`/`lucarne-rmux` out of the base daemon.
+  The `product-terminal` bundle opts into the terminal gateway, remote access,
+  TUI, and rmux stack for release packaging.
 
 See the decision record:
 [`docs/decisions/2026-06-01-lucarned-tui-frontend.md`](decisions/2026-06-01-lucarned-tui-frontend.md).
